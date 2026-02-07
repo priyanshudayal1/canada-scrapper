@@ -1,0 +1,9 @@
+playwright
+aiohttp
+boto3
+python-dotenv
+weasyprint
+requests
+openai-whisper
+Pillow
+pydub

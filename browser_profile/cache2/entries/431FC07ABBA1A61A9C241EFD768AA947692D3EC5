@@ -1,0 +1,444 @@
+(function () {
+    var ddOriginalReferrer = document.referrer;
+    var popUpAllowedClientKeys = [
+        'F45F521D9622089B5E33C18031FB8E',
+        '10D43DA6B79A5089E1A7846864D6BD',
+        '34C213C44735CBC8D9C08B65110F96',
+        'D428D51E28968797BC27FB9153435D',
+        '87B024B36133DBAA93E054371373E7',
+    ];
+    try {
+        if (!ddOriginalReferrer && dd.rr) {
+            ddOriginalReferrer = decodeURIComponent(dd.rr);
+        }
+    } catch (_) {
+        /* Silent failure if decodeURIComponent throws */
+    }
+
+    /**
+     * Saves actual referrer to session storage
+     * @return {void}
+     */
+    function saveReferrer() {
+        try {
+            window.sessionStorage.setItem('ddOriginalReferrer', ddOriginalReferrer);
+        } catch (error) {
+            // Silently fails
+        }
+    }
+    saveReferrer();
+
+    var noScriptMessageElement = document.getElementById('cmsg');
+    var noScriptMessageText = noScriptMessageElement ? noScriptMessageElement.innerText : '';
+    var getRefererQueryParamString = function () {
+        try {
+            var prefix = '&referer=';
+            if (window.location !== window.parent.location) {
+                // Nested Iframe
+                return prefix + encodeURIComponent(window.location.href);
+            }
+            return prefix + encodeURIComponent(window.parent.location.href);
+        } catch (e) {
+            return '';
+        }
+    };
+
+    var isSafari = window.navigator
+        ? /^((?!chrome|android).)*safari/i.test(navigator.userAgent)
+        : false;
+    var stretchHeightRule = isSafari ? 'height: -webkit-fill-available;' : '';
+
+    var getDDCookie = function (value) {
+        var r = new RegExp('datadome=([^;]+)');
+        var v = r.exec(value);
+        if (v != null) {
+            try {
+                return decodeURIComponent(v[1]);
+            } catch (e) {
+                return v[1];
+            }
+        }
+        return null;
+    };
+
+    function getHostname(url) {
+        var scheme = 'https://';
+
+        if (typeof url !== 'string' || url.indexOf(scheme) !== 0) {
+            return '';
+        }
+
+        return url.replace(scheme, '').split('/')[0];
+    }
+
+    // Check if a URL is coming from a DataDome origin.
+    function isDatadomeOrigin(url) {
+        var ddHosts = ['.datado.me', '.captcha-delivery.com'];
+        var hostname = getHostname(url);
+
+        if (!hostname) {
+            return false;
+        }
+
+        for (var i = 0; i < ddHosts.length; i++) {
+            var ddHost = ddHosts[i];
+            if (hostname.indexOf(ddHost, hostname.length - ddHost.length) !== -1) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    function isFpOrigin(url) {
+        var hostname = getHostname(url);
+        var currentHostname = getHostname(window.location.href);
+
+        if (!hostname || !currentHostname) {
+            return false;
+        }
+
+        var hostnameParts = hostname.split('.').reverse();
+        var currentHostnameParts = currentHostname.split('.').reverse();
+        var matchCount = 0;
+
+        for (var i = 0; i < currentHostnameParts.length; ++i) {
+            if (hostnameParts[i] === currentHostnameParts[i]) {
+                ++matchCount;
+            } else {
+                break;
+            }
+        }
+
+        return matchCount >= 2 && hostnameParts[matchCount] === 'ddc';
+    }
+
+    function isTrustedOrigin(url) {
+        return isDatadomeOrigin(url) || isFpOrigin(url);
+    }
+
+    function getQueryParamFromURL(sourceURL, paramName) {
+        if (!window.URL) {
+            return '';
+        }
+        try {
+            var extendedURL = new URL(sourceURL);
+            return extendedURL.searchParams.get(paramName) || '';
+        } catch (error) {
+            return '';
+        }
+    }
+
+    function replaceCookieDomain(cookie, newDomain) {
+        try {
+            cookie = cookie.replace(/Domain=.*?;/, 'Domain=' + newDomain + ';');
+        } catch (_) {
+            // Fail silently.
+        }
+
+        return cookie;
+    }
+
+    function setCookieWithFallback(cookie) {
+        var expectedValue = getDDCookie(cookie);
+
+        if (expectedValue === null) {
+            return false;
+        }
+
+        document.cookie = cookie;
+
+        if (getDDCookie(document.cookie) === expectedValue) {
+            return true;
+        }
+
+        var tryCandidate = function (candidate) {
+            var candidateCookie = replaceCookieDomain(cookie, candidate);
+            document.cookie = candidateCookie;
+
+            var actualValue = getDDCookie(document.cookie);
+            return { candidateCookie: candidateCookie, actualValue: actualValue };
+        };
+
+        var generateCandidates = function (hostname) {
+            var parts = hostname.split('.');
+            var candidates = [];
+            var min = 2,
+                max = parts.length < 8 ? parts.length : 8;
+            for (var i = min; i <= max; ++i) {
+                if (parts.length >= i) {
+                    candidates.push('.' + parts.slice(-1 * i).join('.'));
+                }
+            }
+            if (candidates.length === 0) {
+                candidates.push(hostname);
+            }
+            return candidates;
+        };
+
+        var hostname = window.location.hostname;
+        var candidates = generateCandidates(hostname);
+
+        // Try each candidate until the cookie is saved correctly.
+        for (var i = 0; i < candidates.length; ++i) {
+            var candidate = candidates[i];
+            var res = tryCandidate(candidate);
+            if (res.actualValue === expectedValue) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    function generateIframe(dd, noScriptMessageText, volatile, stretchHeightRule) {
+        var targetOrigin = 'https://' + dd.host.replace(new RegExp('&#x2d;', 'g'), '-');
+        if (!isTrustedOrigin(targetOrigin)) {
+            console.error(
+                '%c Invalid CAPTCHA origin: ' + targetOrigin,
+                'background: red; color: #fff'
+            );
+            return;
+        }
+        var isIframeLoaded = false;
+        var maxTimeoutMs = 5000;
+
+        function iframeOnload() {
+            isIframeLoaded = true;
+            var noIframeElem = document.getElementById('noiframe');
+            if (noIframeElem) {
+                noIframeElem.parentNode.removeChild(noIframeElem);
+            }
+        }
+
+        if (
+            typeof navigator.userAgent === 'string' &&
+            navigator.userAgent.indexOf('Firefox') > -1
+        ) {
+            var initialTime = new Date().getTime();
+            setTimeout(function () {
+                if (!isIframeLoaded && new Date().getTime() - initialTime > maxTimeoutMs) {
+                    document.body.innerHTML =
+                        '<div id="noiframe">' +
+                        noScriptMessageText +
+                        '</div>' +
+                        document.body.innerHTML;
+                }
+            }, maxTimeoutMs);
+        }
+
+        /** @type {('json' | 'html' | null)} - Holds the format of the additional challenge */
+        var ddMessageFormat = getQueryParamFromURL(window.location.href, 'ddMessageFormat');
+
+        var iframeSrc =
+            'https://' +
+            dd.host +
+            '/captcha/?initialCid=' +
+            encodeURIComponent(dd.cid) +
+            '&hash=' +
+            encodeURIComponent(dd.hsh) +
+            '&cid=' +
+            encodeURIComponent(
+                volatile ? window.ddcid : dd.cookie || getDDCookie(document.cookie)
+            ) +
+            (ddMessageFormat ? '&ddMessageFormat=' + encodeURIComponent(ddMessageFormat) : '') +
+            '&t=' +
+            encodeURIComponent(dd.t) +
+            getRefererQueryParamString() +
+            '&s=' +
+            dd.s +
+            '&e=' +
+            dd.e +
+            '&dm=cd' +
+            (dd.cp && dd.cp.name && dd.cp.value
+                ? '&' + encodeURIComponent(dd.cp.name) + '=' + encodeURIComponent(dd.cp.value)
+                : '');
+
+        var iframeSandbox =
+            'allow-scripts allow-same-origin allow-forms' +
+            (popUpAllowedClientKeys.indexOf(dd.hsh) > -1 ? ' allow-popups' : '');
+        var iframePermissions = 'accelerometer; gyroscope; magnetometer';
+        var iframeTitle = 'DataDome CAPTCHA';
+        var iframeHTML =
+            '<iframe src="' +
+            iframeSrc +
+            '" sandbox="' +
+            iframeSandbox +
+            '" allow="' +
+            iframePermissions +
+            '" title="' +
+            iframeTitle +
+            '" width="100%" height="100%" style="height:100vh;' +
+            stretchHeightRule +
+            '" FRAMEBORDER="0" border="0" scrolling="yes"' +
+            '></iframe>';
+
+        return { iframeHTML: iframeHTML, iframeOnload: iframeOnload };
+    }
+    var volatile = document.cookie === '' && window.ddcid != null;
+
+    var iframeResult = generateIframe(dd, noScriptMessageText, volatile, stretchHeightRule);
+    var iframeWrapper = document.createElement('div');
+    iframeWrapper.innerHTML = iframeResult.iframeHTML;
+    var iframeElem = iframeWrapper.firstChild;
+
+    if (iframeElem) {
+        iframeElem.addEventListener('load', iframeResult.iframeOnload);
+    }
+
+    document.body.appendChild(iframeElem);
+
+    if (noScriptMessageElement) {
+        noScriptMessageElement.parentNode.removeChild(noScriptMessageElement);
+    }
+
+    var canGoBack =
+        window.history && typeof window.history.back === 'function' && window.history.length > 1;
+    // `ddShouldGoBack` is an option that can be set by a code snippet in a customer's page customization.
+    var shouldGoBack = (dd.r && dd.r === 'b' && canGoBack) || (window.ddShouldGoBack && canGoBack);
+    var shouldReplay = typeof dd.p === 'string' && dd.p !== '';
+
+    var viewPortTag = document.createElement('meta');
+    viewPortTag.name = 'viewport';
+    viewPortTag.content = 'width=device-width, initial-scale=1.0';
+
+    var headTag = document.querySelector('head');
+    if (headTag != null) {
+        headTag.appendChild(viewPortTag);
+    }
+
+    var onMessageCallback = function (event) {
+        function addSearchParam(url, name, value) {
+            if (typeof window.URL === 'function') {
+                var extendedURL = new URL(url);
+                extendedURL.searchParams.set(name, value);
+
+                return extendedURL.href;
+            }
+
+            return url;
+        }
+
+        if (event.isTrusted && isTrustedOrigin(event.origin)) {
+            if (typeof event.data !== 'string') {
+                return false;
+            }
+
+            try {
+                var data = JSON.parse(event.data);
+
+                if (data.eventType == 'load') {
+                    return false;
+                }
+
+                if (data.cookie) {
+                    setCookieWithFallback(data.cookie);
+                }
+
+                if (data.url) {
+                    setTimeout(function () {
+                        if (shouldReplay) {
+                            var replayForm = document.createElement('form');
+                            replayForm.method = 'POST';
+                            replayForm.action = window.location.href;
+                            var payloadInput = document.createElement('input');
+                            payloadInput.type = 'text';
+                            payloadInput.name = 'payload';
+                            payloadInput.value = dd.p;
+                            replayForm.appendChild(payloadInput);
+                            document.body.appendChild(replayForm);
+                            replayForm.submit();
+                        } else if (shouldGoBack) {
+                            if (volatile && document.referrer.length > 0) {
+                                window.location = addSearchParam(
+                                    document.referrer,
+                                    'ddcid',
+                                    getDDCookie(data.cookie)
+                                );
+                            } else {
+                                history.back();
+                            }
+                        } else {
+                            if (volatile && typeof window.URL === 'function') {
+                                window.location = addSearchParam(
+                                    window.location.href,
+                                    'ddcid',
+                                    getDDCookie(data.cookie)
+                                );
+                            } else if (dd.rr != null) {
+                                // Due to referrer loss on post challenge resolution,
+                                // instead of reloading the page we load the current URL
+                                // with the referrer appended as a query parameter.
+                                var currentBaseUrl =
+                                    window.location.origin + window.location.pathname;
+                                var referrerBaseUrl = document.referrer.split('?')[0].split('#')[0];
+
+                                if (referrerBaseUrl !== currentBaseUrl) {
+                                    var newURL = new URL(window.location.href);
+                                    if (window.location.search === '' && dd.qp != null) {
+                                        var queryParams = new URLSearchParams(
+                                            decodeURIComponent(dd.qp)
+                                        );
+                                        queryParams.set('dd_referrer', ddOriginalReferrer);
+                                        newURL.search = queryParams.toString();
+                                    } else {
+                                        newURL = addSearchParam(
+                                            newURL,
+                                            'dd_referrer',
+                                            ddOriginalReferrer
+                                        );
+                                    }
+                                    window.location.href = newURL.toString();
+                                } else {
+                                    window.location.reload();
+                                }
+                            } else {
+                                window.location.reload();
+                            }
+                        }
+                    }, 500);
+                }
+            } catch (_) {
+                /* Silent failure if JSON.parse is used on invalid data */
+            }
+        }
+    };
+
+    if (window.addEventListener) {
+        window.addEventListener('message', onMessageCallback, false);
+    } else if (window.attachEvent) {
+        window.attachEvent('onmessage', onMessageCallback);
+    }
+})();
+Jºl°@x      i|ŠÒi|ŠÒIQi|ŠÒ   M    O^partitionKey=%28https%2Ccanlii.org%29,:https://ct.captcha-delivery.com/c.js strongly-framed 1 security-info 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 request-method GET response-head HTTP/2 200 
+content-type: text/javascript
+content-length: 14788
+date: Thu, 29 Jan 2026 14:23:28 GMT
+last-modified: Fri, 23 Jan 2026 14:23:10 GMT
+etag: "f89ca26cb5234acc7232780d5eb6cc26"
+x-amz-server-side-encryption: AES256
+x-amz-version-id: null
+accept-ranges: bytes
+server: AmazonS3
+x-cache: Hit from cloudfront
+via: 1.1 fb1afff4bbc2b4643f9eaea484687f82.cloudfront.net (CloudFront)
+x-amz-cf-pop: BOM78-P1
+x-amz-cf-id: hDDe_ivIQDlaTGKEnViCbxyA5fFBNjyrze_746M9kaaZLOO5Cih5uQ==
+age: 73073
+X-Firefox-Spdy: h2
+ original-response-headers content-type: text/javascript
+content-length: 14788
+date: Thu, 29 Jan 2026 14:23:28 GMT
+last-modified: Fri, 23 Jan 2026 14:23:10 GMT
+etag: "f89ca26cb5234acc7232780d5eb6cc26"
+x-amz-server-side-encryption: AES256
+x-amz-version-id: null
+accept-ranges: bytes
+server: AmazonS3
+x-cache: Hit from cloudfront
+via: 1.1 fb1afff4bbc2b4643f9eaea484687f82.cloudfront.net (CloudFront)
+x-amz-cf-pop: BOM78-P1
+x-amz-cf-id: hDDe_ivIQDlaTGKEnViCbxyA5fFBNjyrze_746M9kaaZLOO5Cih5uQ==
+age: 73073
+X-Firefox-Spdy: h2
+ ctid 2 uncompressed-len 0 net-response-time-onstart 244 net-response-time-onstop 245   9Ä
