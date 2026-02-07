@@ -20,7 +20,7 @@ load_dotenv()
 BASE_URL = "https://www.canlii.org"
 START_URL = "https://www.canlii.org/ca"
 SECTION_TITLE = "Legislation"
-WAIT_MS = 2000
+WAIT_MS = 1000
 OUTPUT_DIR = "legislation_pdfs"
 DOWNLOAD_DELAY_MIN = 1  # Minimum delay in seconds between downloads (increased to avoid CAPTCHAs)
 DOWNLOAD_DELAY_MAX = 2  # Maximum delay in seconds between downloads (increased to avoid CAPTCHAs)
@@ -31,7 +31,7 @@ SKIPPED_FILE = "skipped_documents.json"  # File to track repealed/not-in-force d
 # Bedrock CAPTCHA solver configuration
 BEDROCK_MODEL_ID = "qwen.qwen3-vl-235b-a22b"  # Qwen model for vision tasks
 BEDROCK_REGION = os.getenv("AWS_REGION", "us-east-1")
-MAX_CAPTCHA_ATTEMPTS = 3  # Maximum attempts to solve CAPTCHA
+MAX_CAPTCHA_ATTEMPTS = 50  # Maximum attempts to solve CAPTCHA
 
 
 
@@ -840,7 +840,7 @@ def process_legislation_document(page, href, title, citation, prefix, tracking_d
 		return False
 
 	# Create sanitized filename
-	safe_filename = sanitize_filename(f"{prefix}_{citation}_{title}"[:150]) if citation else sanitize_filename(f"{prefix}_{title}"[:150])
+	safe_filename = sanitize_filename(f"{citation}_{title}"[:150]) if citation else sanitize_filename(f"{title}"[:150])
 	s3_key = f"{safe_filename}.pdf"
 	
 
@@ -894,6 +894,119 @@ def process_legislation_document(page, href, title, citation, prefix, tracking_d
 	return False
 
 
+def extract_row_data(row):
+	"""Extract main item and all sub-items (regulations, amendments, enabling statutes) from a table row"""
+	try:
+		return row.evaluate("""
+			(row) => {
+				const result = { main: null, sub_items: [] };
+
+				// --- Extract main item ---
+				const canliiLink = row.querySelector('a.canlii');
+				if (!canliiLink) return result;
+
+				const mainHref = canliiLink.getAttribute('href');
+				const mainTitle = canliiLink.textContent.trim();
+
+				// Get citation
+				let citation = '';
+				const decisionDateTd = row.querySelector('td.decisionDate');
+				if (decisionDateTd) {
+					citation = decisionDateTd.textContent.trim();
+				} else {
+					const nowrap = row.querySelector('td:first-child span.nowrap');
+					if (nowrap) citation = nowrap.textContent.trim();
+				}
+
+				// Check if main item is repealed (Category 4 pattern: direct span with [Repealed...] in same td)
+				let mainRepealed = false;
+				const canliiTd = canliiLink.closest('td');
+				if (canliiTd) {
+					for (const child of canliiTd.childNodes) {
+						if (child.nodeType === 1 && child.tagName === 'SPAN'
+							&& !child.classList.contains('nowrap')
+							&& !child.classList.contains('d-flex')
+							&& !child.classList.contains('text-end')) {
+							const txt = child.textContent.toLowerCase();
+							if (txt.includes('repealed') || txt.includes('not in force') || txt.includes('spent')) {
+								mainRepealed = true;
+							}
+						}
+					}
+				}
+
+				result.main = {
+					href: mainHref,
+					title: mainTitle,
+					citation: citation,
+					is_repealed: mainRepealed
+				};
+
+				// --- Extract sub-items from dropdowns (regulations, amendments) ---
+				// Handles: div[id^='regulation_'] (Categories 1,2) and div[id^='legislation_'] (Category 3)
+				const dropdowns = row.querySelectorAll("div[id^='regulation_'], div[id^='legislation_']");
+				for (const dropdown of dropdowns) {
+					let currentSection = 'in_force';
+
+					for (const child of dropdown.children) {
+						if (child.tagName === 'DIV') {
+							const text = child.textContent.toLowerCase().trim();
+							if (text.includes('repealed') || text.includes('spent') || text.includes('not in force')) {
+								currentSection = 'repealed';
+							} else {
+								currentSection = 'in_force';
+							}
+						} else if (child.tagName === 'UL' && currentSection === 'in_force') {
+							const items = child.querySelectorAll('li');
+							for (const item of items) {
+								const link = item.querySelector('a[href]');
+								if (link) {
+									const nw = item.querySelector('span.nowrap');
+									result.sub_items.push({
+										href: link.getAttribute('href'),
+										title: link.textContent.trim(),
+										citation: nw ? nw.textContent.trim() : '',
+										type: 'sub_item'
+									});
+								}
+							}
+						}
+					}
+				}
+
+				// --- Extract enabling statute from second column (Category 4) ---
+				const tds = row.querySelectorAll('td');
+				if (tds.length >= 2) {
+					const secondTd = tds[1];
+					// Category 4: second td has direct <a> links (not a.canlii, not inside dropdown)
+					const hasCanliiInSecond = secondTd.querySelector('a.canlii');
+					const hasDropdown = secondTd.querySelector("div[id^='regulation_'], div[id^='legislation_']");
+
+					if (!hasCanliiInSecond && !hasDropdown) {
+						const links = secondTd.querySelectorAll('a[href]');
+						for (const link of links) {
+							const href = link.getAttribute('href');
+							if (href && href.includes('/laws/')) {
+								const nw = secondTd.querySelector('span.nowrap');
+								result.sub_items.push({
+									href: href,
+									title: link.textContent.trim(),
+									citation: nw ? nw.textContent.trim() : '',
+									type: 'enabling_statute'
+								});
+							}
+						}
+					}
+				}
+
+				return result;
+			}
+		""")
+	except Exception as e:
+		print(f"  Error in extract_row_data: {e}")
+		return {"main": None, "sub_items": []}
+
+
 def process_category_page(page, tracking_data, category_url):
 	"""Process all items in a category page in real-time"""
 	try:
@@ -928,64 +1041,61 @@ def process_category_page(page, tracking_data, category_url):
 		
 		# IMPORTANT: Collect ALL item data FIRST before navigating away
 		# This prevents stale element references when we navigate to document pages
+		# Uses JavaScript evaluation to also extract sub-items (regulations, amendments, enabling statutes)
 		items_to_process = []
 		rows = page.locator("#legislationsContainer tr").all()
 		total_rows = len(rows)
-		print(f"Found {total_rows} legislation items to process")
+		print(f"Found {total_rows} legislation rows to scan")
 		
 		for row in rows:
 			try:
-				# Extract main link info
-				link_element = row.locator("a.canlii").first
-				if link_element.count() == 0:
-					continue
-					
-				href = link_element.get_attribute("href")
-				title = link_element.inner_text()
-				
-				# Handle different table structures:
-				# - Statutes/AStatutes: <td class="decisionDate">Citation</td>
-				# - Regulations: <td><a>Title</a>, <span class="nowrap">Citation</span></td>
-				citation_element = row.locator("td.decisionDate")
-				if citation_element.count() > 0:
-					citation = citation_element.inner_text()
-				else:
-					# Try to get citation from span.nowrap in the first cell
-					nowrap_element = row.locator("td").first.locator("span.nowrap").first
-					if nowrap_element.count() > 0:
-						citation = nowrap_element.inner_text()
-					else:
-						citation = ""
-				
-				items_to_process.append({
-					"href": href,
-					"title": title,
-					"citation": citation
-				})
-				
+				row_data = extract_row_data(row)
+				if row_data and row_data.get("main"):
+					items_to_process.append(row_data)
 			except Exception as e:
 				print(f"  Error extracting row data: {e}")
 				continue
 		
-		print(f"  Collected {len(items_to_process)} items data from category page")
+		# Count total documents (main + sub-items)
+		total_main = len(items_to_process)
+		total_subs = sum(len(item.get("sub_items", [])) for item in items_to_process)
+		print(f"  Collected {total_main} main items + {total_subs} sub-items = {total_main + total_subs} total documents")
 		
 		processed_count = 0
 		
 		# Now process each item - we have all the data we need stored
 		for i, item in enumerate(items_to_process, 1):
 			try:
-				href = item["href"]
-				title = item["title"]
-				citation = item["citation"]
+				main = item["main"]
+				sub_items = item.get("sub_items", [])
 				
-				print(f"\n  Processing item {i}/{len(items_to_process)}: {title}")
+				# Skip repealed main items (Category 4 pattern: marked in the list itself)
+				if main.get("is_repealed"):
+					print(f"\n  ⏭️  Skipping item {i}/{len(items_to_process)} (repealed in list): {main['title']}")
+					save_skipped_document({
+						"title": main["title"],
+						"href": main["href"],
+						"url": f"{BASE_URL}{main['href']}",
+						"reason": "Repealed, spent or not in force (marked in category list)"
+					})
+					continue
+				
+				print(f"\n  Processing item {i}/{len(items_to_process)}: {main['title']}")
+				if sub_items:
+					print(f"    ({len(sub_items)} sub-items: regulations/amendments/enabling statutes)")
 				
 				# Process Main Document
-				if process_legislation_document(page, href, title, citation, "main", tracking_data):
+				if process_legislation_document(page, main["href"], main["title"], main["citation"], "main", tracking_data):
 					processed_count += 1
 				
-				# After processing, navigate back to the category page
-				# This ensures we can continue processing from a known state
+				# Process sub-items (regulations, amendments, enabling statutes)
+				for j, sub in enumerate(sub_items, 1):
+					sub_type = sub.get("type", "sub_item")
+					print(f"    Sub-item {j}/{len(sub_items)} [{sub_type}]: {sub['title']}")
+					if process_legislation_document(page, sub["href"], sub["title"], sub["citation"], sub_type, tracking_data):
+						processed_count += 1
+				
+				# After processing all items for this row, navigate back to category page
 				page.goto(category_url, wait_until="load")
 				page.wait_for_load_state("networkidle")
 				page.wait_for_timeout(1000)
