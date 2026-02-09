@@ -145,10 +145,7 @@ def get_cookies_dict(page):
 
 def get_firefox_launch_args():
 	"""Get robust Firefox arguments for evasion"""
-	return [
-		"--width=1920",
-		"--height=1080",
-	]
+	return []
 
 
 def get_firefox_user_prefs():
@@ -156,7 +153,7 @@ def get_firefox_user_prefs():
 	return {
 		"dom.webdriver.enabled": False,
 		"useSystemGlobalMediaControls": False,
-		"marionette.enabled": False,
+		# "marionette.enabled": False, # Commented out to prevent connection issues
 		"general.useragent.override": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0",
 		"general.appname.override": "Netscape",
 		"general.appversion.override": "5.0 (Windows)",
