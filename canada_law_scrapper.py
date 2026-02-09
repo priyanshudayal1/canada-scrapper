@@ -1160,8 +1160,8 @@ def handle_captcha_interruption(page):
 		return False
 
 
-def create_pdf_from_html(page, title, content_html, output_path):
-	"""Generate a PDF from HTML content using Playwright"""
+def create_pdf_from_html(playwright_instance, title, content_html, output_path):
+	"""Generate a PDF from HTML content using headless Chromium"""
 	try:
 		# Create a complete HTML document with styling
 		html_document = f"""
@@ -1222,18 +1222,22 @@ def create_pdf_from_html(page, title, content_html, output_path):
 		with open(temp_html_path, 'w', encoding='utf-8') as f:
 			f.write(html_document)
 		
-		# Navigate to the HTML file and generate PDF using Playwright
-		page.goto(f"file:///{os.path.abspath(temp_html_path).replace(os.sep, '/')}", wait_until="load")
-		page.pdf(path=output_path, format='A4', print_background=True)
+		# Use headless Chromium specifically for PDF generation
+		chromium = playwright_instance.chromium.launch(headless=True)
+		pdf_page = chromium.new_page()
+		pdf_page.goto(f"file:///{os.path.abspath(temp_html_path).replace(os.sep, '/')}", wait_until="load")
+		pdf_page.pdf(path=output_path, format='A4', print_background=True)
+		pdf_page.close()
+		chromium.close()
 		
 		# Clean up temporary HTML file
 		os.remove(temp_html_path)
 		
-		print(f"PDF created: {output_path}")
+		print(f"  ✓ PDF created: {os.path.basename(output_path)}")
 		return True
 		
 	except Exception as e:
-		print(f"Error creating PDF: {e}")
+		print(f"  ✗ Error creating PDF: {e}")
 		return False
 
 
@@ -1307,8 +1311,9 @@ def process_legislation_document(page, href, title, citation, prefix, tracking_d
 		if doc_title and content_html:
 			pdf_path = os.path.join(OUTPUT_DIR, s3_key)
 			
-			# Generate PDF
-			if create_pdf_from_html(page, doc_title, content_html, pdf_path):
+			# Generate PDF (pass playwright instance from page context)
+			playwright_instance = page.context.browser.playwright
+			if create_pdf_from_html(playwright_instance, doc_title, content_html, pdf_path):
 				# Upload to S3
 				if upload_to_s3(pdf_path, s3_key):
 					delete_local_file(pdf_path)
@@ -1455,7 +1460,7 @@ def process_category_page(page, tracking_data, category_url):
 				if show_more_button.count() > 0 and show_more_button.is_visible():
 					print("  Clicking 'Show more results'...")
 					show_more_button.click()
-					page.wait_for_timeout(1500)
+					page.wait_for_timeout(2000)
 					
 					# Quick check for CAPTCHA during pagination
 					if is_captcha_page(page):
@@ -1463,15 +1468,18 @@ def process_category_page(page, tracking_data, category_url):
 						if handle_captcha_interruption(page):
 							print("    🔄 Resuming pagination after recovery...")
 							page.goto(category_url, wait_until="load")
+							page.wait_for_timeout(2000)
 						else:
 							print("    Waiting for manual CAPTCHA solve...")
 							while is_captcha_page(page):
 								page.wait_for_timeout(5000)
-						page.wait_for_timeout(1500)
+						page.wait_for_timeout(2000)
 				else:
 					break
 			except Exception:
 				break
+		
+		print("  All records loaded, starting extraction...")
 		
 		# IMPORTANT: Collect ALL item data FIRST before navigating away
 		# This prevents stale element references when we navigate to document pages
