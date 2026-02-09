@@ -14,6 +14,11 @@ from dotenv import load_dotenv
 import platform
 from PIL import Image
 import logging
+from html.parser import HTMLParser
+from xml.sax.saxutils import escape
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 
 # Load environment variables
 load_dotenv()
@@ -309,7 +314,7 @@ def delete_local_file(file_path):
 	"""Delete a local file after successful upload"""
 	try:
 		if os.path.exists(file_path):
-			os.remove(file_path)
+			# os.remove(file_path)
 			print(f"  🗑️  Deleted local file: {os.path.basename(file_path)}")
 			return True
 	except Exception as e:
@@ -1160,78 +1165,135 @@ def handle_captcha_interruption(page):
 		return False
 
 
-def create_pdf_from_html(playwright_instance, title, content_html, output_path):
-	"""Generate a PDF from HTML content using headless Chromium"""
+
+class SimpleHTMLBlockParser(HTMLParser):
+	"""Extract blocks while preserving basic inline formatting and links."""
+	BLOCK_TAGS = {"h1", "h2", "h3", "h4", "p", "li", "div"}
+	INLINE_TAGS = {
+		"strong": "b",
+		"b": "b",
+		"em": "i",
+		"i": "i",
+		"cite": "i",
+		"u": "u",
+	}
+
+	def __init__(self):
+		super().__init__()
+		self.blocks = []
+		self._current_tag = None
+		self._current_fragments = []
+		self._inline_stack = []
+
+	def handle_starttag(self, tag, attrs):
+		if tag in self.BLOCK_TAGS:
+			self._flush_current()
+			self._current_tag = tag
+			return
+
+		self._ensure_block()
+
+		if tag == "br":
+			self._current_fragments.append("<br/>")
+			return
+
+		if tag == "a":
+			attr_dict = dict(attrs)
+			href = attr_dict.get("href")
+			if href:
+				full_href = href if href.startswith("http") else f"{BASE_URL}{href}"
+				safe_href = escape(full_href, {'"': "&quot;"})
+				self._current_fragments.append(f"<a href=\"{safe_href}\">")
+				self._inline_stack.append("a")
+			return
+
+		mapped = self.INLINE_TAGS.get(tag)
+		if mapped:
+			self._current_fragments.append(f"<{mapped}>")
+			self._inline_stack.append(mapped)
+
+	def handle_endtag(self, tag):
+		if tag in self.BLOCK_TAGS:
+			self._flush_current()
+			self._current_tag = None
+			return
+
+		if tag == "a" and self._inline_stack:
+			last = self._inline_stack.pop()
+			if last == "a":
+				self._current_fragments.append("</a>")
+			return
+
+		mapped = self.INLINE_TAGS.get(tag)
+		if mapped and self._inline_stack:
+			last = self._inline_stack.pop()
+			if last == mapped:
+				self._current_fragments.append(f"</{mapped}>")
+
+	def handle_data(self, data):
+		if data:
+			self._ensure_block()
+			self._current_fragments.append(escape(data))
+
+	def _ensure_block(self):
+		if not self._current_tag:
+			self._current_tag = "p"
+
+	def _flush_current(self):
+		if not self._current_fragments:
+			return
+		text = "".join(self._current_fragments)
+		text = re.sub(r"\s+", " ", text).strip()
+		if text:
+			tag = self._current_tag or "p"
+			self.blocks.append((tag, text))
+		self._current_fragments = []
+		self._inline_stack = []
+
+
+def create_pdf_from_html(title, content_html, output_path):
+	"""Generate a PDF from HTML content using ReportLab (no external deps)."""
 	try:
-		# Create a complete HTML document with styling
-		html_document = f"""
-		<!DOCTYPE html>
-		<html>
-		<head>
-			<meta charset="UTF-8">
-			<title>{title}</title>
-			<style>
-				@page {{
-					size: A4;
-					margin: 2cm;
-				}}
-				body {{
-					font-family: Arial, sans-serif;
-					line-height: 1.6;
-					color: #333;
-					max-width: 210mm;
-					margin: 0 auto;
-					padding: 20px;
-				}}
-				h1 {{
-					color: #1a1a1a;
-					border-bottom: 2px solid #333;
-					padding-bottom: 10px;
-					margin-bottom: 20px;
-				}}
-				h2 {{
-					color: #2a2a2a;
-					margin-top: 25px;
-					margin-bottom: 15px;
-				}}
-				h3 {{
-					color: #3a3a3a;
-					margin-top: 20px;
-					margin-bottom: 10px;
-				}}
-				section {{
-					margin-bottom: 20px;
-				}}
-				.order {{
-					margin-left: 20px;
-				}}
-				p {{
-					margin-bottom: 10px;
-				}}
-			</style>
-		</head>
-		<body>
-			<h1>{title}</h1>
-			{content_html}
-		</body>
-		</html>
-		"""
-		
-		# Create a temporary HTML file
-		temp_html_path = output_path.replace('.pdf', '_temp.html')
-		with open(temp_html_path, 'w', encoding='utf-8') as f:
-			f.write(html_document)
-		
-		# Use headless Chromium specifically for PDF generation
-		chromium = playwright_instance.chromium.launch(headless=True)
-		pdf_page = chromium.new_page()
-		pdf_page.goto(f"file:///{os.path.abspath(temp_html_path).replace(os.sep, '/')}", wait_until="load")
-		pdf_page.pdf(path=output_path, format='A4', print_background=True)
-		pdf_page.close()
-		chromium.close()
-		
-		# Clean up temporary HTML file
-		os.remove(temp_html_path)
+		parser = SimpleHTMLBlockParser()
+		parser.feed(content_html or "")
+		parser._flush_current()
+
+		doc = SimpleDocTemplate(
+			output_path,
+			pagesize=A4,
+			leftMargin=56,
+			rightMargin=56,
+			topMargin=56,
+			bottomMargin=56,
+		)
+		styles = getSampleStyleSheet()
+		head_title = ParagraphStyle(
+			"DocTitle",
+			parent=styles["Title"],
+			spaceAfter=12,
+		)
+		head_h1 = ParagraphStyle("H1", parent=styles["Heading1"], spaceAfter=8)
+		head_h2 = ParagraphStyle("H2", parent=styles["Heading2"], spaceAfter=6)
+		head_h3 = ParagraphStyle("H3", parent=styles["Heading3"], spaceAfter=4)
+		head_h4 = ParagraphStyle("H4", parent=styles["Heading4"], spaceAfter=4)
+		body = ParagraphStyle("Body", parent=styles["BodyText"], leading=14, spaceAfter=6)
+
+		story = [Paragraph(title, head_title), Spacer(1, 6)]
+		for tag, text in parser.blocks:
+			if tag == "h1":
+				story.append(Paragraph(text, head_h1))
+			elif tag == "h2":
+				story.append(Paragraph(text, head_h2))
+			elif tag == "h3":
+				story.append(Paragraph(text, head_h3))
+			elif tag == "h4":
+				story.append(Paragraph(text, head_h4))
+			elif tag == "li":
+				story.append(Paragraph(f"• {text}", body))
+			else:
+				story.append(Paragraph(text, body))
+
+		doc.build(story)
 		
 		print(f"  ✓ PDF created: {os.path.basename(output_path)}")
 		return True
@@ -1311,9 +1373,8 @@ def process_legislation_document(page, href, title, citation, prefix, tracking_d
 		if doc_title and content_html:
 			pdf_path = os.path.join(OUTPUT_DIR, s3_key)
 			
-			# Generate PDF (pass playwright instance from page context)
-			playwright_instance = page.context.browser.playwright
-			if create_pdf_from_html(playwright_instance, doc_title, content_html, pdf_path):
+			# Generate PDF using ReportLab
+			if create_pdf_from_html(doc_title, content_html, pdf_path):
 				# Upload to S3
 				if upload_to_s3(pdf_path, s3_key):
 					delete_local_file(pdf_path)

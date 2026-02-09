@@ -2,7 +2,7 @@ playwright
 aiohttp
 boto3
 python-dotenv
-weasyprint
+reportlab
 requests
 openai-whisper
 Pillow
