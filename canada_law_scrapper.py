@@ -14,11 +14,6 @@ from dotenv import load_dotenv
 import platform
 from PIL import Image
 import logging
-from html.parser import HTMLParser
-from xml.sax.saxutils import escape
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 
 # Load environment variables
 load_dotenv()
@@ -412,28 +407,47 @@ def extract_document_content(page, href="", title=""):
 		if not is_document_in_force(page, href, title):
 			return None, None
 
-		# Extract title
-		title_element = page.locator("h1.main-title").first
-		title = title_element.inner_text() if title_element.count() > 0 else "Untitled Document"
+		# Extract title - try multiple selectors
+		title = None
+		title_selectors = [
+			"h1.main-title",
+			"h2.Title-of-Act",
+			"section.intro h2",
+			"h1"
+		]
+		for selector in title_selectors:
+			title_element = page.locator(selector).first
+			if title_element.count() > 0:
+				title = title_element.inner_text().strip()
+				break
 		
-		# Wait for content to confirm page load
-		try:
-			page.wait_for_selector("#docCont", timeout=5000)
-		except:
-			# If #docCont not found, check if it's maybe just a different structure or error
-			if page.locator(".docContents").count() > 0:
-				pass # Alternate class exists
-			else:
-				print("    Warning: Content element #docCont not found")
-				return None, None
+		if not title:
+			title = "Untitled Document"
 		
-		# Extract the main content
-		content_element = page.locator("#docCont")
-		if content_element.count() == 0:
-			# Try fallback to class
-			content_element = page.locator(".docContents").first
+		# Wait for content to confirm page load - try multiple selectors
+		content_found = False
+		content_selectors = ["#docCont", ".docContents", "div.docContents"]
 		
-		if content_element.count() == 0:
+		for selector in content_selectors:
+			try:
+				page.wait_for_selector(selector, timeout=5000)
+				content_found = True
+				break
+			except:
+				continue
+		
+		if not content_found:
+			print("    Warning: Content element not found")
+			return None, None
+		
+		# Extract the main content - try multiple selectors
+		content_element = None
+		for selector in content_selectors:
+			content_element = page.locator(selector).first
+			if content_element.count() > 0:
+				break
+		
+		if not content_element or content_element.count() == 0:
 			print("    Warning: Content element not found")
 			return None, None
 		
@@ -1166,225 +1180,156 @@ def handle_captcha_interruption(page):
 
 
 
-class SimpleHTMLBlockParser(HTMLParser):
-	"""Extract blocks while preserving inline formatting, links, and structure."""
-	BLOCK_TAGS = {"h1", "h2", "h3", "h4", "p"}
-	INLINE_TAGS = {
-		"strong": "b",
-		"b": "b",
-		"em": "i",
-		"i": "i",
-		"cite": "i",
-		"u": "u",
-	}
-	# Container tags that are transparent (content flows through)
-	TRANSPARENT_TAGS = {
-		"section", "header", "ul", "ol", "table", "tr", "td", "th",
-		"thead", "tbody", "span", "abbr", "sup", "sub", "para",
-	}
-
-	def __init__(self):
-		super().__init__()
-		self.blocks = []
-		self._current_tag = None
-		self._current_fragments = []
-		self._inline_stack = []
-		self._pending_bullet = False
-
-	def handle_starttag(self, tag, attrs):
-		if tag in self.BLOCK_TAGS:
-			self._flush_current()
-			self._current_tag = tag
-			return
-
-		# <li>: flush, then mark next real content block as a list item
-		if tag == "li":
-			self._flush_current()
-			self._pending_bullet = True
-			return
-
-		# <div>: soft block break (flush current paragraph, don't set type)
-		if tag == "div":
-			self._flush_current()
-			return
-
-		# Transparent containers – let content flow through
-		if tag in self.TRANSPARENT_TAGS:
-			return
-
-		self._ensure_block()
-
-		if tag == "br":
-			self._current_fragments.append("<br/>")
-			return
-
-		if tag == "a":
-			attr_dict = dict(attrs)
-			href = attr_dict.get("href")
-			if href:
-				full_href = href if href.startswith("http") else f"{BASE_URL}{href}"
-				safe_href = escape(full_href, {'"': "&quot;"})
-				self._current_fragments.append(f"<link href=\"{safe_href}\"><font color=\"#1a0dab\">")
-				self._inline_stack.append("link")
-				self._inline_stack.append("font")
-			return
-
-		mapped = self.INLINE_TAGS.get(tag)
-		if mapped:
-			self._current_fragments.append(f"<{mapped}>")
-			self._inline_stack.append(mapped)
-
-	def handle_endtag(self, tag):
-		if tag in self.BLOCK_TAGS:
-			self._flush_current()
-			self._current_tag = None
-			return
-
-		if tag == "li":
-			self._flush_current()
-			self._pending_bullet = False
-			return
-
-		if tag == "div":
-			self._flush_current()
-			return
-
-		if tag in self.TRANSPARENT_TAGS:
-			return
-
-		# Determine target tag name for inline close
-		if tag == "a":
-			target = "link"
-		else:
-			target = self.INLINE_TAGS.get(tag)
-			if not target:
-				return
-
-		if target not in self._inline_stack:
-			return
-
-		# Find the target in the stack (search from top)
-		idx = len(self._inline_stack) - 1
-		while idx >= 0 and self._inline_stack[idx] != target:
-			idx -= 1
-
-		# Close everything from top of stack down to target (inclusive)
-		for i in range(len(self._inline_stack) - 1, idx - 1, -1):
-			self._current_fragments.append(f"</{self._inline_stack[i]}>")
-
-		# Re-open any tags that were above the target (misnested HTML recovery)
-		above = self._inline_stack[idx + 1:]
-		self._inline_stack = self._inline_stack[:idx]
-		for t in above:
-			self._current_fragments.append(f"<{t}>")
-			self._inline_stack.append(t)
-
-	def handle_data(self, data):
-		if data:
-			self._ensure_block()
-			self._current_fragments.append(escape(data))
-
-	def handle_entityref(self, name):
-		"""Handle HTML entities like &nbsp;"""
-		self._ensure_block()
-		if name == "nbsp":
-			self._current_fragments.append(" ")
-		else:
-			self._current_fragments.append(f"&{name};")
-
-	def _ensure_block(self):
-		if not self._current_tag:
-			self._current_tag = "p"
-
-	def _flush_current(self):
-		if not self._current_fragments:
-			self._inline_stack = []
-			return
-		# Auto-close any open inline tags in reverse order
-		for open_tag in reversed(self._inline_stack):
-			self._current_fragments.append(f"</{open_tag}>")
-		carry_over = list(self._inline_stack)
-		self._inline_stack = []
-		text = "".join(self._current_fragments)
-		text = re.sub(r"\s+", " ", text).strip()
-		if text:
-			tag = self._current_tag or "p"
-			# If inside a <li>, mark first real content block as list item
-			if self._pending_bullet:
-				tag = "li"
-				self._pending_bullet = False
-			self.blocks.append((tag, text))
-		self._current_fragments = []
-		# Re-open carried-over inline tags for the next block
-		for open_tag in carry_over:
-			self._current_fragments.append(f"<{open_tag}>")
-			self._inline_stack.append(open_tag)
-
-
-def _balance_tags(text):
-	"""Ensure all inline tags in markup are properly closed for ReportLab."""
-	open_tags = []
-	for m in re.finditer(r'<(/?)(\w+)(?:\s[^>]*)?(/?)\.?>', text):
-		is_close = m.group(1) == '/'
-		tag_name = m.group(2).lower()
-		is_self_close = m.group(3) == '/'
-		if is_self_close:
-			continue
-		if is_close:
-			for i in range(len(open_tags) - 1, -1, -1):
-				if open_tags[i] == tag_name:
-					open_tags.pop(i)
-					break
-		else:
-			open_tags.append(tag_name)
-	for tag in reversed(open_tags):
-		text += f"</{tag}>"
-	return text
-
-
-def create_pdf_from_html(title, content_html, output_path):
-	"""Generate a PDF from HTML content using ReportLab (no external deps)."""
+def create_pdf_from_html(chrome_page, title, content_html, output_path):
+	"""Generate a PDF from HTML content using Chrome/Playwright"""
 	try:
-		parser = SimpleHTMLBlockParser()
-		parser.feed(content_html or "")
-		parser._flush_current()
-
-		doc = SimpleDocTemplate(
-			output_path,
-			pagesize=A4,
-			leftMargin=56,
-			rightMargin=56,
-			topMargin=56,
-			bottomMargin=56,
-		)
-		styles = getSampleStyleSheet()
-		head_title = ParagraphStyle(
-			"DocTitle", parent=styles["Title"], spaceAfter=8,
-		)
-		head_h1 = ParagraphStyle("H1", parent=styles["Heading1"], spaceBefore=10, spaceAfter=4)
-		head_h2 = ParagraphStyle("H2", parent=styles["Heading2"], spaceBefore=8, spaceAfter=3)
-		head_h3 = ParagraphStyle("H3", parent=styles["Heading3"], spaceBefore=6, spaceAfter=2)
-		head_h4 = ParagraphStyle("H4", parent=styles["Heading4"], spaceBefore=4, spaceAfter=2)
-		body = ParagraphStyle("Body", parent=styles["BodyText"], leading=13, spaceAfter=3)
-		li_style = ParagraphStyle("ListItem", parent=body, leftIndent=20, bulletIndent=10)
-
-		story = [Paragraph(_balance_tags(escape(title)), head_title), Spacer(1, 4)]
-		for tag, text in parser.blocks:
-			text = _balance_tags(text)
-			if tag == "h1":
-				story.append(Paragraph(text, head_h1))
-			elif tag == "h2":
-				story.append(Paragraph(text, head_h2))
-			elif tag == "h3":
-				story.append(Paragraph(text, head_h3))
-			elif tag == "h4":
-				story.append(Paragraph(text, head_h4))
-			elif tag == "li":
-				story.append(Paragraph(f"\u2022 {text}", li_style))
-			else:
-				story.append(Paragraph(text, body))
-
-		doc.build(story)
+		html_document = f"""
+		<!DOCTYPE html>
+		<html>
+		<head>
+			<meta charset="UTF-8">
+			<title>{title}</title>
+			<style>
+				@page {{
+					size: A4;
+					margin: 2cm;
+				}}
+				body {{
+					font-family: Arial, sans-serif;
+					line-height: 1.6;
+					color: #333;
+					max-width: 210mm;
+					margin: 0 auto;
+					padding: 20px;
+				}}
+				h1, h2.Title-of-Act {{
+					color: #1a1a1a;
+					border-bottom: 2px solid #333;
+					padding-bottom: 10px;
+					margin-bottom: 20px;
+					font-size: 1.8em;
+				}}
+				h2.Part, h3.Subheading, h4.Subheading {{
+					color: #2a2a2a;
+					margin-top: 25px;
+					margin-bottom: 15px;
+					font-weight: bold;
+				}}
+				h2.Part {{
+					font-size: 1.5em;
+					border-bottom: 1px solid #666;
+				}}
+				h3.Subheading {{
+					font-size: 1.3em;
+				}}
+				h4.Subheading {{
+					font-size: 1.1em;
+				}}
+				.MarginalNote {{
+					font-style: italic;
+					color: #666;
+					margin: 10px 0 5px 0;
+					font-size: 0.9em;
+				}}
+				.Section, .Subsection {{
+					margin: 12px 0;
+					line-height: 1.8;
+				}}
+				.Section strong, .Subsection strong {{
+					margin-right: 8px;
+				}}
+				.sectionLabel {{
+					font-weight: bold;
+					color: #000;
+				}}
+				p.centered {{
+					text-align: center;
+					margin: 15px 0;
+				}}
+				p.right-align {{
+					text-align: right;
+					margin: 10px 0;
+				}}
+				p.indent-0-0, p.indent-1-0 {{
+					margin: 8px 0;
+				}}
+				p.indent-1-0 {{
+					margin-left: 20px;
+				}}
+				ul.ProvisionList {{
+					list-style-type: none;
+					padding-left: 0;
+					margin: 15px 0;
+				}}
+				ul.ProvisionList > li {{
+					margin: 12px 0;
+				}}
+				.listItemBlock1, .listItemBlock3 {{
+					display: flex;
+					margin: 10px 0;
+				}}
+				.listItemLabel {{
+					font-weight: bold;
+					min-width: 40px;
+					flex-shrink: 0;
+				}}
+				.listItemText1, .listItemText2 {{
+					flex: 1;
+				}}
+				.Smallcaps {{
+					font-variant: small-caps;
+				}}
+				.Repealed {{
+					color: #999;
+					font-style: italic;
+				}}
+				.order {{
+					margin: 20px 0;
+				}}
+				.intro {{
+					margin-bottom: 25px;
+				}}
+				section {{
+					margin: 20px 0;
+				}}
+				/* Hide interactive elements */
+				.bootstrap, .viibes-marker-toolbox, .viibes-marker {{
+					display: none !important;
+				}}
+				/* Clean up links */
+				a {{
+					color: #0066cc;
+					text-decoration: none;
+				}}
+				sup {{
+					font-size: 0.7em;
+				}}
+				table {{
+					border-collapse: collapse;
+					width: 100%;
+					margin: 15px 0;
+				}}
+				table td, table th {{
+					padding: 8px;
+					border: 1px solid #ddd;
+				}}
+			</style>
+		</head>
+		<body>
+			<h1>{title}</h1>
+			{content_html}
+		</body>
+		</html>
+		"""
+		
+		temp_html_path = output_path.replace('.pdf', '_temp.html')
+		with open(temp_html_path, 'w', encoding='utf-8') as f:
+			f.write(html_document)
+		
+		chrome_page.goto(f"file:///{os.path.abspath(temp_html_path).replace(os.sep, '/')}", wait_until="load")
+		chrome_page.pdf(path=output_path, format='A4', print_background=True)
+		
+		os.remove(temp_html_path)
 		
 		print(f"  ✓ PDF created: {os.path.basename(output_path)}")
 		return True
@@ -1420,7 +1365,7 @@ def handle_cookie_consent(page):
 		print("Continuing without accepting cookies...")
 
 
-def process_legislation_document(page, href, title, citation, prefix, tracking_data):
+def process_legislation_document(page, chrome_page, href, title, citation, prefix, tracking_data):
 	"""Process a single legislation document (download, PDF, S3, track)"""
 	# Create document key for tracking
 	doc_key = f"{prefix}_{href}"
@@ -1464,8 +1409,8 @@ def process_legislation_document(page, href, title, citation, prefix, tracking_d
 		if doc_title and content_html:
 			pdf_path = os.path.join(OUTPUT_DIR, s3_key)
 			
-			# Generate PDF using ReportLab
-			if create_pdf_from_html(doc_title, content_html, pdf_path):
+			# Generate PDF using Chrome
+			if create_pdf_from_html(chrome_page, doc_title, content_html, pdf_path):
 				# Upload to S3
 				if upload_to_s3(pdf_path, s3_key):
 					delete_local_file(pdf_path)
@@ -1598,7 +1543,7 @@ def extract_row_data(row):
 		return {"main": None, "sub_items": []}
 
 
-def process_category_page(page, tracking_data, category_url):
+def process_category_page(page, chrome_page, tracking_data, category_url):
 	"""Process all items in a category page in real-time"""
 	try:
 		# Wait for the table to be populated
@@ -1679,14 +1624,14 @@ def process_category_page(page, tracking_data, category_url):
 					print(f"    ({len(sub_items)} sub-items: regulations/amendments/enabling statutes)")
 				
 				# Process Main Document
-				if process_legislation_document(page, main["href"], main["title"], main["citation"], "main", tracking_data):
+				if process_legislation_document(page, chrome_page, main["href"], main["title"], main["citation"], "main", tracking_data):
 					processed_count += 1
 				
 				# Process sub-items (regulations, amendments, enabling statutes)
 				for j, sub in enumerate(sub_items, 1):
 					sub_type = sub.get("type", "sub_item")
 					print(f"    Sub-item {j}/{len(sub_items)} [{sub_type}]: {sub['title']}")
-					if process_legislation_document(page, sub["href"], sub["title"], sub["citation"], sub_type, tracking_data):
+					if process_legislation_document(page, chrome_page, sub["href"], sub["title"], sub["citation"], sub_type, tracking_data):
 						processed_count += 1
 				
 				# After processing all items for this row, navigate back to category page
@@ -1759,6 +1704,12 @@ def main():
 
 		logger.info("Creating new page...")
 		page = context.new_page()
+		
+		# Create Chrome browser for PDF generation
+		logger.info("Launching Chrome browser for PDF generation...")
+		chrome_browser = p.chromium.launch(headless=True)
+		chrome_context = chrome_browser.new_context()
+		chrome_page = chrome_context.new_page()
 		
 		# Add random mouse movement to simulate human behavior
 		page.mouse.move(random.randint(100, 500), random.randint(100, 500))
@@ -1880,13 +1831,14 @@ def main():
 				page.wait_for_timeout(WAIT_MS)
 			
 			# Process all items in this category immediately
-			count = process_category_page(page, tracking_data, category_url)
+			count = process_category_page(page, chrome_page, tracking_data, category_url)
 			total_processed += count
 		
 		print(f"\n=== Scraping Complete ===")
 		print(f"Total documents downloaded: {total_processed}")
 		print(f"PDFs saved in S3: s3://{S3_BUCKET_NAME}/")
 		
+		chrome_browser.close()
 		browser.close()
 
 
