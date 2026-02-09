@@ -1167,8 +1167,8 @@ def handle_captcha_interruption(page):
 
 
 class SimpleHTMLBlockParser(HTMLParser):
-	"""Extract blocks while preserving basic inline formatting and links."""
-	BLOCK_TAGS = {"h1", "h2", "h3", "h4", "p", "li", "div", "para"}
+	"""Extract blocks while preserving inline formatting, links, and structure."""
+	BLOCK_TAGS = {"h1", "h2", "h3", "h4", "p"}
 	INLINE_TAGS = {
 		"strong": "b",
 		"b": "b",
@@ -1177,6 +1177,11 @@ class SimpleHTMLBlockParser(HTMLParser):
 		"cite": "i",
 		"u": "u",
 	}
+	# Container tags that are transparent (content flows through)
+	TRANSPARENT_TAGS = {
+		"section", "header", "ul", "ol", "table", "tr", "td", "th",
+		"thead", "tbody", "span", "abbr", "sup", "sub", "para",
+	}
 
 	def __init__(self):
 		super().__init__()
@@ -1184,11 +1189,27 @@ class SimpleHTMLBlockParser(HTMLParser):
 		self._current_tag = None
 		self._current_fragments = []
 		self._inline_stack = []
+		self._pending_bullet = False
 
 	def handle_starttag(self, tag, attrs):
 		if tag in self.BLOCK_TAGS:
 			self._flush_current()
-			self._current_tag = "p" if tag == "para" else tag
+			self._current_tag = tag
+			return
+
+		# <li>: flush, then mark next real content block as a list item
+		if tag == "li":
+			self._flush_current()
+			self._pending_bullet = True
+			return
+
+		# <div>: soft block break (flush current paragraph, don't set type)
+		if tag == "div":
+			self._flush_current()
+			return
+
+		# Transparent containers – let content flow through
+		if tag in self.TRANSPARENT_TAGS:
 			return
 
 		self._ensure_block()
@@ -1203,7 +1224,6 @@ class SimpleHTMLBlockParser(HTMLParser):
 			if href:
 				full_href = href if href.startswith("http") else f"{BASE_URL}{href}"
 				safe_href = escape(full_href, {'"': "&quot;"})
-				# Use ReportLab's <link> plus a colored font wrapper for differentiation
 				self._current_fragments.append(f"<link href=\"{safe_href}\"><font color=\"#1a0dab\">")
 				self._inline_stack.append("link")
 				self._inline_stack.append("font")
@@ -1220,16 +1240,28 @@ class SimpleHTMLBlockParser(HTMLParser):
 			self._current_tag = None
 			return
 
-		# Determine target tag name
+		if tag == "li":
+			self._flush_current()
+			self._pending_bullet = False
+			return
+
+		if tag == "div":
+			self._flush_current()
+			return
+
+		if tag in self.TRANSPARENT_TAGS:
+			return
+
+		# Determine target tag name for inline close
 		if tag == "a":
 			target = "link"
 		else:
 			target = self.INLINE_TAGS.get(tag)
 			if not target:
-				return  # Unknown tag, ignore
+				return
 
 		if target not in self._inline_stack:
-			return  # Not opened, ignore
+			return
 
 		# Find the target in the stack (search from top)
 		idx = len(self._inline_stack) - 1
@@ -1252,6 +1284,14 @@ class SimpleHTMLBlockParser(HTMLParser):
 			self._ensure_block()
 			self._current_fragments.append(escape(data))
 
+	def handle_entityref(self, name):
+		"""Handle HTML entities like &nbsp;"""
+		self._ensure_block()
+		if name == "nbsp":
+			self._current_fragments.append(" ")
+		else:
+			self._current_fragments.append(f"&{name};")
+
 	def _ensure_block(self):
 		if not self._current_tag:
 			self._current_tag = "p"
@@ -1263,13 +1303,16 @@ class SimpleHTMLBlockParser(HTMLParser):
 		# Auto-close any open inline tags in reverse order
 		for open_tag in reversed(self._inline_stack):
 			self._current_fragments.append(f"</{open_tag}>")
-		# Remember which tags were open so we can re-open them in the next block
 		carry_over = list(self._inline_stack)
 		self._inline_stack = []
 		text = "".join(self._current_fragments)
 		text = re.sub(r"\s+", " ", text).strip()
 		if text:
 			tag = self._current_tag or "p"
+			# If inside a <li>, mark first real content block as list item
+			if self._pending_bullet:
+				tag = "li"
+				self._pending_bullet = False
 			self.blocks.append((tag, text))
 		self._current_fragments = []
 		# Re-open carried-over inline tags for the next block
@@ -1316,17 +1359,16 @@ def create_pdf_from_html(title, content_html, output_path):
 		)
 		styles = getSampleStyleSheet()
 		head_title = ParagraphStyle(
-			"DocTitle",
-			parent=styles["Title"],
-			spaceAfter=12,
+			"DocTitle", parent=styles["Title"], spaceAfter=8,
 		)
-		head_h1 = ParagraphStyle("H1", parent=styles["Heading1"], spaceAfter=8)
-		head_h2 = ParagraphStyle("H2", parent=styles["Heading2"], spaceAfter=6)
-		head_h3 = ParagraphStyle("H3", parent=styles["Heading3"], spaceAfter=4)
-		head_h4 = ParagraphStyle("H4", parent=styles["Heading4"], spaceAfter=4)
-		body = ParagraphStyle("Body", parent=styles["BodyText"], leading=14, spaceAfter=6)
+		head_h1 = ParagraphStyle("H1", parent=styles["Heading1"], spaceBefore=10, spaceAfter=4)
+		head_h2 = ParagraphStyle("H2", parent=styles["Heading2"], spaceBefore=8, spaceAfter=3)
+		head_h3 = ParagraphStyle("H3", parent=styles["Heading3"], spaceBefore=6, spaceAfter=2)
+		head_h4 = ParagraphStyle("H4", parent=styles["Heading4"], spaceBefore=4, spaceAfter=2)
+		body = ParagraphStyle("Body", parent=styles["BodyText"], leading=13, spaceAfter=3)
+		li_style = ParagraphStyle("ListItem", parent=body, leftIndent=20, bulletIndent=10)
 
-		story = [Paragraph(_balance_tags(title), head_title), Spacer(1, 6)]
+		story = [Paragraph(_balance_tags(escape(title)), head_title), Spacer(1, 4)]
 		for tag, text in parser.blocks:
 			text = _balance_tags(text)
 			if tag == "h1":
@@ -1338,7 +1380,7 @@ def create_pdf_from_html(title, content_html, output_path):
 			elif tag == "h4":
 				story.append(Paragraph(text, head_h4))
 			elif tag == "li":
-				story.append(Paragraph(f"• {text}", body))
+				story.append(Paragraph(f"\u2022 {text}", li_style))
 			else:
 				story.append(Paragraph(text, body))
 
