@@ -309,7 +309,7 @@ def delete_local_file(file_path):
 	"""Delete a local file after successful upload"""
 	try:
 		if os.path.exists(file_path):
-			# os.remove(file_path)
+			os.remove(file_path)
 			print(f"  🗑️  Deleted local file: {os.path.basename(file_path)}")
 			return True
 	except Exception as e:
@@ -571,6 +571,9 @@ def solve_datadome_audio_captcha(page):
 	logger.info("\n🎧 Attempting to solve DataDome audio CAPTCHA...")
 	
 	try:
+		# Handle cookie banner first
+		handle_cookie_consent(page)
+		
 		# Find the frame containing the CAPTCHA (silent to avoid repeated logging)
 		captcha_frame = is_datadome_captcha(page, silent=True)
 		if not captcha_frame:
@@ -666,11 +669,23 @@ def solve_datadome_audio_captcha(page):
 			logger.info("✅ DataDome CAPTCHA solved successfully!")
 			return True
 		else:
-			logger.warning("❌ CAPTCHA still present, may need to retry...")
+			logger.warning("❌ CAPTCHA still present, refreshing page...")
+			# Refresh page to get new CAPTCHA
+			try:
+				page.reload(wait_until="domcontentloaded")
+				page.wait_for_timeout(2000)
+			except:
+				pass
 			return False
 		
 	except Exception as e:
 		logger.error(f"⚠️  Error solving DataDome CAPTCHA: {e}")
+		# Refresh page on error
+		try:
+			page.reload(wait_until="domcontentloaded")
+			page.wait_for_timeout(2000)
+		except:
+			pass
 		return False
 
 
@@ -701,7 +716,8 @@ def solve_canlii_audio_captcha(page):
 	"""Solve CanLII standard audio CAPTCHA"""
 	logger.info("\n🎧 Attempting to solve CanLII audio CAPTCHA...")
 	
-	# Ensure blocking elements are gone
+	# Handle cookie banner and blocking elements
+	handle_cookie_consent(page)
 	force_remove_cookie_modal(page)
 	
 	try:
@@ -792,11 +808,21 @@ def solve_canlii_audio_captcha(page):
 			logger.info("✅ CanLII Audio CAPTCHA solved successfully!")
 			return True
 		else:
-			logger.warning("❌ CAPTCHA solution incorrect")
+			logger.warning("❌ CAPTCHA solution incorrect, refreshing...")
+			try:
+				page.reload(wait_until="domcontentloaded")
+				page.wait_for_timeout(2000)
+			except:
+				pass
 			return False
 			
 	except Exception as e:
 		logger.error(f"⚠️  Error solving CanLII audio CAPTCHA: {e}")
+		try:
+			page.reload(wait_until="domcontentloaded")
+			page.wait_for_timeout(2000)
+		except:
+			pass
 		return False
 
 
@@ -1261,6 +1287,44 @@ def create_pdf_from_html(chrome_page, title, content_html, output_path):
 					padding-left: 0;
 					margin: 15px 0;
 				}}
+				/* Schedule heading styles */
+				.Schedule header {{
+					margin: 30px 0 20px 0;
+				}}
+				h2.scheduleLabel {{
+					font-size: 1.5em;
+					font-weight: bold;
+					color: #1a1a1a;
+					margin: 0;
+					padding: 0;
+					border: none;
+				}}
+				.scheduleLabel {{
+					display: block;
+					font-weight: bold;
+					margin-bottom: 5px;
+				}}
+				.scheduleTitleText {{
+					display: block;
+					font-weight: normal;
+					font-size: 0.85em;
+					margin-top: 5px;
+				}}
+				/* Other document elements */
+				.ChapterNumber, .EnablingAct, .LongTitle {{
+					margin: 8px 0;
+					font-weight: normal;
+				}}
+				.ChapterNumber {{
+					font-style: italic;
+				}}
+				.EnablingAct {{
+					font-weight: bold;
+					text-transform: uppercase;
+				}}
+				.FlushLeft {{
+					margin: 5px 0;
+				}}
 				ul.ProvisionList > li {{
 					margin: 12px 0;
 				}}
@@ -1341,28 +1405,35 @@ def create_pdf_from_html(chrome_page, title, content_html, output_path):
 
 def handle_cookie_consent(page):
 	"""Handle cookie consent banner if it appears"""
-	print("Checking for cookie banner...")
-	
 	try:
-		page.wait_for_selector("#cookieConsentBanner", state="visible", timeout=10000)
-		print("Cookie banner detected")
+		# Try multiple selectors for cookie banner
+		cookie_selectors = [
+			"#understandCookieConsent",
+			"button:has-text('Accept')",
+			"button:has-text('I understand')",
+			".cookie-accept",
+			"#cookieConsentBanner button"
+		]
 		
-		page.wait_for_selector("#understandCookieConsent", state="visible", timeout=5000)
-		print("Accept button found, attempting to click...")
+		for selector in cookie_selectors:
+			try:
+				if page.locator(selector).count() > 0:
+					page.locator(selector).first.click(timeout=3000)
+					page.wait_for_timeout(1000)
+					return
+			except:
+				continue
 		
-		try:
-			page.click("#understandCookieConsent", timeout=3000)
-			print("Cookie consent clicked successfully")
-		except:
-			print("Playwright click failed, trying JavaScript...")
-			page.evaluate("document.getElementById('understandCookieConsent').click()")
-			print("Cookie consent clicked successfully (JavaScript)")
-		
-		page.wait_for_timeout(1000)
-		
-	except Exception as e:
-		print(f"Cookie consent handling: {e}")
-		print("Continuing without accepting cookies...")
+		# Force remove with JavaScript
+		page.evaluate("""
+			const banner = document.getElementById('cookieConsentBanner');
+			if (banner) banner.remove();
+			const blocker = document.getElementById('cookieConsentBlocker');
+			if (blocker) blocker.remove();
+			document.body.style.overflow = 'auto';
+		""")
+	except:
+		pass
 
 
 def process_legislation_document(page, chrome_page, href, title, citation, prefix, tracking_data):
