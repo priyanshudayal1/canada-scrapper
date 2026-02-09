@@ -13,14 +13,23 @@ from pathlib import Path
 from dotenv import load_dotenv
 import platform
 from PIL import Image
+import logging
 
 # Load environment variables
 load_dotenv()
 
+# Configure logging
+logging.basicConfig(
+	level=logging.INFO,
+	format='%(asctime)s - %(levelname)s - %(message)s',
+	datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
 BASE_URL = "https://www.canlii.org"
 START_URL = "https://www.canlii.org/ca"
 SECTION_TITLE = "Legislation"
-WAIT_MS = 1000
+WAIT_MS = 2000
 OUTPUT_DIR = "legislation_pdfs"
 DOWNLOAD_DELAY_MIN = 1  # Minimum delay in seconds between downloads (increased to avoid CAPTCHAs)
 DOWNLOAD_DELAY_MAX = 2  # Maximum delay in seconds between downloads (increased to avoid CAPTCHAs)
@@ -33,24 +42,131 @@ BEDROCK_MODEL_ID = "qwen.qwen3-vl-235b-a22b"  # Qwen model for vision tasks
 BEDROCK_REGION = os.getenv("AWS_REGION", "us-east-1")
 MAX_CAPTCHA_ATTEMPTS = 50  # Maximum attempts to solve CAPTCHA
 
+# Access restriction cooldown settings
+ACCESS_RESTRICTED_WAIT_MIN = 10  # Minimum wait time in minutes
+ACCESS_RESTRICTED_WAIT_MAX = 20  # Maximum wait time in minutes
 
 
-def get_browser_args():
-	"""Get robust browser arguments for evasion"""
+
+def is_access_restricted_page(page):
+	"""Check if the page shows an access restricted/IP blocked message"""
+	try:
+		access_restricted_indicators = [
+			"text=Access Denied",
+			"text=access denied",
+			"text=Access Restricted",
+			"text=access restricted",
+			"text=temporarily blocked",
+			"text=temporarily restricted",
+			"text=Too many requests",
+			"text=too many requests",
+			"text=rate limit",
+			"text=Rate Limit",
+			"text=blocked due to",
+			"text=IP has been blocked",
+			"text=IP address has been",
+			"text=automated access",
+			"text=unusual activity",
+			"text=suspicious activity",
+			"text=Please try again later",
+			"text=come back later",
+		]
+		
+		for indicator in access_restricted_indicators:
+			try:
+				if page.locator(indicator).count() > 0:
+					logger.warning(f"🚫 Access restriction detected via: {indicator}")
+					return True
+			except:
+				continue
+		
+		# Also check page content for common blocking messages
+		try:
+			body_text = page.locator("body").inner_text().lower()
+			blocking_phrases = [
+				"access denied",
+				"access restricted",
+				"temporarily blocked",
+				"too many requests",
+				"rate limit exceeded",
+				"ip has been blocked",
+				"ip address has been blocked",
+				"automated access detected",
+				"unusual activity detected",
+			]
+			for phrase in blocking_phrases:
+				if phrase in body_text:
+					logger.warning(f"🚫 Access restriction detected in body: '{phrase}'")
+					return True
+		except:
+			pass
+		
+		return False
+	except:
+		return False
+
+
+def wait_for_ip_cooldown(page, reason="access restriction"):
+	"""Wait for 10-20 minutes to let IP restriction clear"""
+	wait_minutes = random.randint(ACCESS_RESTRICTED_WAIT_MIN, ACCESS_RESTRICTED_WAIT_MAX)
+	wait_seconds = wait_minutes * 60
+	
+	logger.warning("\n" + "="*60)
+	logger.warning("🚫 ACCESS RESTRICTED - IP COOLDOWN REQUIRED")
+	logger.warning("="*60)
+	logger.warning(f"Reason: {reason}")
+	logger.info(f"Waiting for {wait_minutes} minutes to let IP restriction clear...")
+	logger.info(f"Start time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+	logger.info(f"Resume time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time() + wait_seconds))}")
+	logger.warning("="*60 + "\n")
+	
+	# Wait with countdown updates every minute
+	for remaining_minutes in range(wait_minutes, 0, -1):
+		print(f"    ⏳ {remaining_minutes} minute(s) remaining...")
+		# Wait 1 minute (60 seconds)
+		for _ in range(12):  # 12 * 5 seconds = 60 seconds
+			page.wait_for_timeout(5000)
+	
+	logger.info("\n" + "="*60)
+	logger.info("✅ IP COOLDOWN COMPLETE - Resuming operations")
+	logger.info("="*60 + "\n")
+	
+	return True
+
+
+def get_cookies_dict(page):
+	"""Get cookies from Playwright context as a dictionary"""
+	cookies = page.context.cookies()
+	cookie_dict = {}
+	for cookie in cookies:
+		cookie_dict[cookie['name']] = cookie['value']
+	return cookie_dict
+
+
+def get_firefox_launch_args():
+	"""Get robust Firefox arguments for evasion"""
 	return [
-		"--disable-blink-features=AutomationControlled",
-		"--disable-infobars",
-		"--no-sandbox",
-		"--disable-setuid-sandbox",
-		"--disable-dev-shm-usage",
-		"--disable-accelerated-2d-canvas",
-		"--disable-gpu",
-		"--window-size=1920,1080",
-		"--start-maximized",
-		"--lang=en-US,en",
-		"--exclude-switches=enable-automation",
-		"--disable-features=IsolateOrigins,site-per-process",
+		"--width=1920",
+		"--height=1080",
 	]
+
+
+def get_firefox_user_prefs():
+	"""Get Firefox user preferences for stealth"""
+	return {
+		"dom.webdriver.enabled": False,
+		"useSystemGlobalMediaControls": False,
+		"marionette.enabled": False,
+		"general.useragent.override": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0",
+		"general.appname.override": "Netscape",
+		"general.appversion.override": "5.0 (Windows)",
+		"general.platform.override": "Win32",
+		"general.oscpu.override": "Windows NT 10.0; Win64; x64",
+		"privacy.resistFingerprinting": False,
+		"network.cookie.cookieBehavior": 0,
+		"toolkit.telemetry.enabled": False,
+		"datareporting.healthreport.uploadEnabled": False,
+	}
 
 
 def get_stealth_scripts():
@@ -58,13 +174,6 @@ def get_stealth_scripts():
 	return [
 		# Override navigator.webdriver
 		"Object.defineProperty(navigator, 'webdriver', {get: () => undefined})",
-		
-		# Mock chrome object
-		"""
-		window.chrome = {
-			runtime: {}
-		};
-		""",
 		
 		# Mock permissions
 		"""
@@ -74,13 +183,6 @@ def get_stealth_scripts():
 			Promise.resolve({ state: 'denied' }) :
 			originalQuery(parameters)
 		);
-		""",
-		
-		# Mock plugins
-		"""
-		Object.defineProperty(navigator, 'plugins', {
-			get: () => [1, 2, 3, 4, 5],
-		});
 		""",
 		
 		# Mock languages
@@ -344,8 +446,12 @@ def extract_document_content(page, href="", title=""):
 
 
 def is_captcha_page(page):
-	"""Check if the current page is a CAPTCHA page (CanLII or DataDome)"""
+	"""Check if the current page is a CAPTCHA page (CanLII or DataDome) or access restricted"""
 	try:
+		# Check for access restriction first
+		if is_access_restricted_page(page):
+			return True
+		
 		# Check for CanLII CAPTCHA elements
 		captcha_indicators = [
 			"text=Dear User",
@@ -369,7 +475,7 @@ def is_captcha_page(page):
 		return False
 
 
-def is_datadome_captcha(page):
+def is_datadome_captcha(page, silent=False):
 	"""Check if the current page has a DataDome CAPTCHA, checking all frames"""
 	try:
 		datadome_indicators = [
@@ -390,7 +496,8 @@ def is_datadome_captcha(page):
 			for indicator in datadome_indicators:
 				try:
 					if frame.locator(indicator).count() > 0:
-						print(f"    🔴 DataDome detected in frame '{frame.name or frame.url}' via: {indicator}")
+						if not silent:
+							logger.info(f"🔴 DataDome detected via: {indicator}")
 						return frame
 				except:
 					continue
@@ -400,29 +507,71 @@ def is_datadome_captcha(page):
 		return None
 
 
+def is_datadome_access_restricted(page):
+	"""
+	Check if the DataDome CAPTCHA is showing 'Access is temporarily restricted' message.
+	This variant has no solvable CAPTCHA - requires waiting for IP cooldown.
+	"""
+	try:
+		# Check all frames for the access restricted message
+		for frame in page.frames:
+			try:
+				# Check for the specific title element with access restricted text
+				title_element = frame.locator(".captcha__human__title")
+				if title_element.count() > 0:
+					title_text = title_element.inner_text().lower().strip()
+					if "temporarily restricted" in title_text or "access" in title_text and "restricted" in title_text:
+						print(f"    🚫 DataDome ACCESS RESTRICTED detected: '{title_text}'")
+						return True
+				
+				# Also check for the warning text about unusual activity
+				warning_element = frame.locator(".captcha__robot__warning__why")
+				if warning_element.count() > 0:
+					warning_text = warning_element.inner_text().lower().strip()
+					if "unusual activity" in warning_text or "detected" in warning_text:
+						# This is an access restriction, not a solvable CAPTCHA
+						# Check if there's NO audio button (meaning it's just a block page)
+						audio_btn = frame.locator("#captcha__audio__button")
+						slider = frame.locator(".sliderContainer, #captcha__slider")
+						if audio_btn.count() == 0 and slider.count() == 0:
+							print(f"    🚫 DataDome ACCESS RESTRICTED (no solvable elements): '{warning_text[:50]}...'")
+							return True
+			except:
+				continue
+		
+		return False
+	except:
+		return False
+
+
 def solve_datadome_audio_captcha(page):
-	"""Solve DataDome audio CAPTCHA by transcribing numbers"""
-	print("\n🎧 Attempting to solve DataDome audio CAPTCHA...")
+	"""Solve DataDome audio CAPTCHA by transcribing numbers
+	
+	Returns:
+		True if solved successfully
+		False if failed but can retry
+		None if timeout (indicates possible access restriction)
+	"""
+	logger.info("\n🎧 Attempting to solve DataDome audio CAPTCHA...")
 	
 	try:
-		# Find the frame containing the CAPTCHA
-		captcha_frame = is_datadome_captcha(page)
+		# Find the frame containing the CAPTCHA (silent to avoid repeated logging)
+		captcha_frame = is_datadome_captcha(page, silent=True)
 		if not captcha_frame:
 			# Fallback to main page if not found (though it should be)
 			captcha_frame = page
 			
 		# Wait for the captcha container to load
 		try:
-			# Check for common containers instead of the iframe id itself
 			captcha_frame.wait_for_selector("#captcha-container, .captcha-container, #captcha__audio__button", timeout=10000)
 		except:
-			print("    ⚠️  Timeout waiting for captcha elements")
-			return False
+			logger.warning("⚠️  Timeout waiting for captcha elements")
+			return None  # Signal timeout to caller
 		
 		# Click on audio button to switch to audio mode
 		audio_button = captcha_frame.locator("#captcha__audio__button")
 		if audio_button.count() > 0:
-			print("    Clicking audio button...")
+			logger.info("Clicking audio button...")
 			audio_button.click()
 			page.wait_for_timeout(1500)
 		
@@ -438,48 +587,56 @@ def solve_datadome_audio_captcha(page):
 		# Get the audio URL
 		audio_element = captcha_frame.locator("audio.audio-captcha-track")
 		if audio_element.count() == 0:
-			print("    ⚠️  Audio element not found")
+			logger.warning("⚠️  Audio element not found")
 			return False
 		
 		audio_url = audio_element.get_attribute("src")
 		if not audio_url:
-			print("    ⚠️  Audio URL not found")
+			logger.warning("⚠️  Audio URL not found")
 			return False
 		
-		print(f"    📥 Downloading audio from: {audio_url[:50]}...")
+		logger.info(f"📥 Downloading audio from: {audio_url[:50]}...")
 		
 		# Download the audio file
 		try:
 			response = requests.get(audio_url, timeout=30)
 			if response.status_code != 200:
-				print(f"    ⚠️  Failed to download audio: {response.status_code}")
+				logger.error(f"⚠️  Failed to download audio: {response.status_code}")
 				return False
 			
 			audio_data = response.content
 		except Exception as e:
-			print(f"    ⚠️  Error downloading audio: {e}")
+			logger.error(f"⚠️  Error downloading audio: {e}")
 			return False
 		
-		# Transcribe using AWS Transcribe
+		# Transcribe using Whisper
 		numbers = transcribe_audio_captcha(audio_data)
 		
 		if not numbers or len(numbers) != 6:
-			print(f"    ⚠️  Failed to get 6 digits, got: {numbers}")
+			logger.warning(f"⚠️  Failed to get 6 digits, got: {numbers}")
 			return False
 		
-		print(f"    🔢 Transcribed numbers: {numbers}")
+		logger.info(f"🔢 Transcribed numbers: {numbers}")
 		
 		# Fill in the 6 input fields
 		inputs = captcha_frame.locator(".audio-captcha-inputs").all()
 		if len(inputs) != 6:
-			print(f"    ⚠️  Expected 6 inputs, found {len(inputs)}")
-			return False
+			try:
+				# Sometimes inputs load slowly
+				page.wait_for_timeout(1000)
+				inputs = captcha_frame.locator(".audio-captcha-inputs").all()
+			except:
+				pass
+			
+			if len(inputs) != 6:
+				logger.warning(f"⚠️  Expected 6 inputs, found {len(inputs)}")
+				return False
 		
 		for i, digit in enumerate(numbers):
 			inputs[i].fill(str(digit))
 			page.wait_for_timeout(100)
 		
-		print("    ✅ Filled in all digits, submitting...")
+		logger.info("✅ Filled in all digits, submitting...")
 		
 		# Click verify button
 		page.wait_for_timeout(500)
@@ -490,14 +647,140 @@ def solve_datadome_audio_captcha(page):
 		
 		# Check if CAPTCHA was solved
 		if not is_datadome_captcha(page):
-			print("    ✅ DataDome CAPTCHA solved successfully!")
+			logger.info("✅ DataDome CAPTCHA solved successfully!")
 			return True
 		else:
-			print("    ❌ CAPTCHA still present, may need to retry...")
+			logger.warning("❌ CAPTCHA still present, may need to retry...")
 			return False
 		
 	except Exception as e:
-		print(f"    ⚠️  Error solving DataDome CAPTCHA: {e}")
+		logger.error(f"⚠️  Error solving DataDome CAPTCHA: {e}")
+		return False
+
+
+def force_remove_cookie_modal(page):
+	"""Aggressively remove cookie consent modal and backdrop"""
+	try:
+		page.evaluate("""
+			const idsToRemove = [
+				'cookieConsentBlocker',
+				'cookieConsentBanner',
+				'cookieConsentModal',
+				'cookieConsentContainer'
+			];
+			idsToRemove.forEach(id => {
+				const el = document.getElementById(id);
+				if (el) el.remove();
+			});
+			const backdrops = document.querySelectorAll('.modal-backdrop');
+			backdrops.forEach(el => el.remove());
+			document.body.classList.remove('modal-open');
+			document.body.style.overflow = 'auto';
+		""")
+	except:
+		pass
+
+
+def solve_canlii_audio_captcha(page):
+	"""Solve CanLII standard audio CAPTCHA"""
+	logger.info("\n🎧 Attempting to solve CanLII audio CAPTCHA...")
+	
+	# Ensure blocking elements are gone
+	force_remove_cookie_modal(page)
+	
+	try:
+		# Check if audio is already visible
+		audio_tag = page.locator("#audioCaptchaTag")
+		needs_toggle = True
+		
+		# Check visibility properly
+		if audio_tag.count() > 0:
+			if audio_tag.is_visible():
+				logger.info("Audio tag already visible.")
+				needs_toggle = False
+		
+		if needs_toggle:
+			# Locate the audio toggle button
+			audio_toggle = page.locator("#toggleAudio")
+			if audio_toggle.count() == 0:
+				logger.warning("⚠️  Audio toggle button not found")
+				return False
+				
+			logger.info("Clicking audio toggle button...")
+			try:
+				audio_toggle.click(force=True)
+				page.wait_for_timeout(1000)
+			except Exception as e:
+				logger.warning(f"⚠️  Could not click audio toggle: {e}")
+				return False
+			
+		# Re-locate audio tag
+		audio_tag = page.locator("#audioCaptchaTag")
+		if audio_tag.count() == 0:
+			logger.warning("⚠️  Audio tag not found")
+			return False
+			
+		# Wait specifically for src attribute
+		logger.info("Waiting for audio source...")
+		try:
+			for _ in range(10):
+				src = audio_tag.get_attribute("src")
+				if src:
+					break
+				page.wait_for_timeout(500)
+		except:
+			pass
+			
+		audio_src = audio_tag.get_attribute("src")
+		if not audio_src:
+			logger.warning("⚠️  Audio source not found")
+			return False
+			
+		full_audio_url = BASE_URL + audio_src if audio_src.startswith("/") else audio_src
+		logger.info(f"📥 Downloading audio from: {full_audio_url[:50]}...")
+		
+		# Download audio with headers to avoid 403
+		cookies = get_cookies_dict(page)
+		user_agent = page.evaluate("navigator.userAgent")
+		headers = {
+			"User-Agent": user_agent,
+			"Referer": page.url
+		}
+		
+		response = requests.get(full_audio_url, headers=headers, cookies=cookies, timeout=30)
+		
+		if response.status_code != 200:
+			logger.error(f"⚠️  Failed to download audio: {response.status_code}")
+			return False
+			
+		audio_data = response.content
+		
+		# Transcribe
+		numbers = transcribe_audio_captcha(audio_data)
+		if not numbers:
+			logger.warning("⚠️  Transcription failed")
+			return False
+			
+		logger.info(f"🔢 Transcribed text: {numbers}")
+		
+		# Fill response
+		captcha_input = page.locator("#captchaResponse")
+		captcha_input.fill(numbers)
+		
+		# Submit
+		logger.info("Submitted answer, clicking ok...")
+		page.locator("input[type='submit'][value='ok']").click()
+		page.wait_for_timeout(3000)
+		
+		if not is_captcha_page(page):
+			logger.info("✅ CanLII Audio CAPTCHA solved successfully!")
+			return True
+		else:
+			logger.warning("❌ CAPTCHA solution incorrect")
+			return False
+			
+	except Exception as e:
+		logger.error(f"⚠️  Error solving CanLII audio CAPTCHA: {e}")
 		return False
 
 
@@ -514,7 +797,11 @@ def transcribe_audio_captcha(audio_data):
 		# Load the model (this will download it on first run - approx 140MB)
 		model = whisper.load_model("base")
 		
-		print("    Title: Transcribing audio...")
+		# Suppress FP16 warning on CPU
+		import warnings
+		warnings.filterwarnings("ignore", message="FP16 is not supported on CPU")
+		
+		logger.info("Transcribing audio...")
 		result = model.transcribe(temp_path)
 		transcript = result["text"]
 		
@@ -528,7 +815,7 @@ def transcribe_audio_captcha(audio_data):
 		return numbers
 			
 	except Exception as e:
-		print(f"    ⚠️  Transcription error: {e}")
+		logger.error(f"⚠️  Transcription error: {e}")
 		if temp_path and os.path.exists(temp_path):
 			try:
 				os.unlink(temp_path)
@@ -613,15 +900,67 @@ def solve_captcha_with_bedrock(image_bytes):
 
 def solve_captcha_automatically(page):
 	"""Attempt to automatically solve the CAPTCHA on the page"""
-	print("\n🤖 Attempting automatic CAPTCHA solving...")
+	logger.info("\n🤖 Attempting automatic CAPTCHA solving...")
+
+	# Remove cookie consent blocker if present
+	force_remove_cookie_modal(page)
 	
 	# First, check for DataDome CAPTCHA (slider/audio type)
 	if is_datadome_captcha(page):
-		print("    📌 Detected DataDome CAPTCHA (slider/audio type)")
-		for attempt in range(1, MAX_CAPTCHA_ATTEMPTS + 1):
-			print(f"    DataDome attempt {attempt}/{MAX_CAPTCHA_ATTEMPTS}...")
-			if solve_datadome_audio_captcha(page):
+		# CRITICAL: Check if this is an "Access Restricted" variant (no solvable CAPTCHA)
+		if is_datadome_access_restricted(page):
+			logger.warning("🚫 This is a DataDome ACCESS RESTRICTED page - NOT a solvable CAPTCHA!")
+			logger.warning("🚫 IP has been rate-limited. Triggering cooldown...")
+			wait_for_ip_cooldown(page, reason="DataDome Access Restricted - IP rate-limited after high download volume")
+			# After cooldown, check if access is restored
+			page.goto(START_URL, wait_until="commit")
+			page.wait_for_load_state("domcontentloaded")
+			page.wait_for_timeout(3000)
+			# Check again - might need another cooldown or regular CAPTCHA
+			if is_datadome_access_restricted(page):
+				logger.warning("⚠️  Still access restricted after cooldown, waiting again...")
+				wait_for_ip_cooldown(page, reason="Still access restricted after first cooldown")
+				page.goto(START_URL, wait_until="commit")
+				page.wait_for_load_state("domcontentloaded")
+			# Now check if there's a regular CAPTCHA or if we're clear
+			if not is_captcha_page(page):
+				logger.info("✅ Access restored after cooldown!")
 				return True
+			else:
+				# There might be a regular CAPTCHA now, recurse
+				return solve_captcha_automatically(page)
+		
+		logger.info("📌 Detected DataDome CAPTCHA (slider/audio type)")
+		consecutive_timeouts = 0
+		for attempt in range(1, MAX_CAPTCHA_ATTEMPTS + 1):
+			logger.info(f"DataDome attempt {attempt}/{MAX_CAPTCHA_ATTEMPTS}...")
+			solve_result = solve_datadome_audio_captcha(page)
+			if solve_result is True:
+				return True
+			elif solve_result is None:  # Timeout detected
+				consecutive_timeouts += 1
+				# After 5 consecutive timeouts, assume it's actually an access restricted variant
+				if consecutive_timeouts >= 5:
+					logger.warning("🚫 Too many consecutive timeouts - checking if this is actually Access Restricted...")
+					if is_datadome_access_restricted(page):
+						logger.warning("🚫 Confirmed: This is Access Restricted, not a solvable CAPTCHA!")
+						wait_for_ip_cooldown(page, reason="DataDome Access Restricted detected after timeout pattern")
+						page.goto(START_URL, wait_until="commit")
+						page.wait_for_load_state("domcontentloaded")
+						return solve_captcha_automatically(page)
+					else:
+						logger.warning("⚠️  Elements not loading, but not access restricted. May need manual solve.")
+						break
+			else:
+				consecutive_timeouts = 0  # Reset counter on non-timeout failures
+			
+			# Check if it became access restricted during attempts
+			if is_datadome_access_restricted(page):
+				logger.warning("🚫 CAPTCHA attempts triggered access restriction!")
+				wait_for_ip_cooldown(page, reason="Access restricted after CAPTCHA solve attempts")
+				page.goto(START_URL, wait_until="commit")
+				page.wait_for_load_state("domcontentloaded")
+				return solve_captcha_automatically(page)
 			# Reload captcha for next attempt
 			try:
 				reload_button = page.locator("#captcha__reload__button")
@@ -630,40 +969,55 @@ def solve_captcha_automatically(page):
 					page.wait_for_timeout(2000)
 			except:
 				pass
-		print("    ⚠️  DataDome auto-solve failed, waiting for manual input...")
+		logger.warning("⚠️  DataDome auto-solve failed, waiting for manual input...")
 		return False
 	
-	# Fall back to CanLII text CAPTCHA
+	# Fall back to CanLII CAPTCHA
 	for attempt in range(1, MAX_CAPTCHA_ATTEMPTS + 1):
-		print(f"    Attempt {attempt}/{MAX_CAPTCHA_ATTEMPTS}...")
+		logger.info(f"Attempt {attempt}/{MAX_CAPTCHA_ATTEMPTS}...")
+		
+		# Try Audio First
+		if solve_canlii_audio_captcha(page):
+			return True
+			
+		logger.warning("⚠️  Audio solve failed/skipped, trying Visual/Bedrock...")
 		
 		try:
+			# Ensure we are in Visual mode (Audio mode hides the image)
+			captcha_img = page.locator("#captchaTag")
+			if captcha_img.count() > 0 and not captcha_img.is_visible():
+				logger.info("Image hidden, toggling back to Visual mode...")
+				toggle_btn = page.locator("#toggleAudio")
+				if toggle_btn.count() > 0:
+					toggle_btn.click(force=True)
+					page.wait_for_timeout(1500)
+			
 			# Wait for captcha image to load
-			page.wait_for_selector("#captchaTag", timeout=5000)
+			page.wait_for_selector("#captchaTag", state="visible", timeout=5000)
 			captcha_img = page.locator("#captchaTag")
 			
-			if captcha_img.count() == 0:
-				print("    ⚠️  CAPTCHA image not found")
+			if captcha_img.count() == 0 or not captcha_img.is_visible():
+				logger.warning("⚠️  CAPTCHA image not found or not visible")
 				continue
 			
 			# Take screenshot of the CAPTCHA image
 			image_bytes = captcha_img.screenshot()
 			
 			if not image_bytes:
-				print("    ⚠️  Failed to capture CAPTCHA image")
+				logger.warning("⚠️  Failed to capture CAPTCHA image")
 				continue
 			
 			# Solve using Bedrock
 			captcha_solution = solve_captcha_with_bedrock(image_bytes)
 			
 			if not captcha_solution:
-				print("    ⚠️  Could not extract CAPTCHA text")
+				logger.warning("⚠️  Could not extract CAPTCHA text")
 				# Refresh captcha for next attempt by reloading
 				page.reload()
 				page.wait_for_timeout(2000)
 				continue
 			
-			print(f"    🔍 Detected CAPTCHA text: {captcha_solution}")
+			logger.info(f"🔍 Detected CAPTCHA text: {captcha_solution}")
 			
 			# Enter the solution
 			captcha_input = page.locator("#captchaResponse")
@@ -675,33 +1029,116 @@ def solve_captcha_automatically(page):
 			
 			# Check if CAPTCHA was solved successfully
 			if not is_captcha_page(page):
-				print("    ✅ CAPTCHA solved successfully!")
+				logger.info("✅ CAPTCHA solved successfully!")
 				return True
 			else:
-				print("    ❌ CAPTCHA solution was incorrect, retrying...")
-				page.wait_for_timeout(1000)
+				logger.warning("❌ CAPTCHA solution was incorrect, retrying...")
+				# Refresh page to get a new captcha challenge
+				page.reload()
+				page.wait_for_timeout(2000)
 				
 		except Exception as e:
-			print(f"    ⚠️  Error during CAPTCHA solving: {e}")
+			logger.error(f"⚠️  Error during CAPTCHA solving: {e}")
+			# Force reload to reset state if stuck
+			try:
+				page.reload()
+				page.wait_for_timeout(2000)
+			except:
+				pass
 			continue
 	
-	print("    ⚠️  Auto-solve failed after max attempts, waiting for manual input...")
+	logger.warning("⚠️  Auto-solve failed after max attempts, waiting for manual input...")
 	return False
 
 
 def handle_captcha_interruption(page):
 	"""
 	Handle CAPTCHA detected during deep processing.
-	Strategy: Go to Homepage -> Solve -> Return True so caller can retry.
+	Strategy: Check for access restriction -> Wait if needed -> Go to Homepage -> Solve -> Return True so caller can retry.
 	"""
-	print("\n🛑 CAPTCHA INTERRUPTION DETECTED!")
-	print(f"   Initiating recovery protocol...")
+	logger.warning("\n🛑 CAPTCHA INTERRUPTION DETECTED!")
+	logger.info("Initiating recovery protocol...")
 	
 	try:
+		# Check for DataDome "Access Restricted" variant FIRST (inside iframe)
+		if is_datadome_access_restricted(page):
+			logger.warning("🚫 DataDome ACCESS RESTRICTED detected - IP rate-limited!")
+			wait_for_ip_cooldown(page, reason="DataDome Access Restricted during scraping")
+			
+			# After waiting, go to homepage and check again
+			logger.info(f"Navigating to homepage ({START_URL}) after cooldown...")
+			page.goto(START_URL, wait_until="commit")
+			page.wait_for_load_state("domcontentloaded")
+			
+			# If still restricted after waiting, wait again
+			if is_datadome_access_restricted(page):
+				logger.warning("⚠️  Still access restricted after first cooldown, waiting again...")
+				wait_for_ip_cooldown(page, reason="DataDome still restricted after first cooldown")
+				page.goto(START_URL, wait_until="commit")
+				page.wait_for_load_state("domcontentloaded")
+			
+			# Now check for remaining CAPTCHA
+			if is_captcha_page(page) and not is_datadome_access_restricted(page):
+				logger.info("Found solvable CAPTCHA after cooldown. Solving...")
+				if solve_captcha_automatically(page):
+					print("   ✅ CAPTCHA solved after cooldown!")
+					page.wait_for_timeout(2000)
+					return True
+				else:
+					print("   ⚠️  Auto-solve failed. Waiting for manual input...")
+					while is_captcha_page(page):
+						page.wait_for_timeout(5000)
+					print("   ✅ Manual solve detected!")
+					return True
+			else:
+				print("   ✅ Access restored after cooldown!")
+				return True
+		
+		# Check for regular access restriction (main page body)
+		if is_access_restricted_page(page):
+			print("   🚫 Access restriction detected - IP may be blocked due to high download volume")
+			wait_for_ip_cooldown(page, reason="Access restriction detected during scraping")
+			
+			# After waiting, go to homepage and check again
+			print(f"   Navigating to homepage ({START_URL}) after cooldown...")
+			page.goto(START_URL, wait_until="commit")
+			page.wait_for_load_state("domcontentloaded")
+			
+			# If still restricted after waiting, wait again
+			if is_access_restricted_page(page):
+				print("   ⚠️  Still restricted after first cooldown, waiting again...")
+				wait_for_ip_cooldown(page, reason="Access still restricted after first cooldown")
+				page.goto(START_URL, wait_until="commit")
+				page.wait_for_load_state("domcontentloaded")
+			
+			# Now check for remaining CAPTCHA
+			if is_captcha_page(page) and not is_access_restricted_page(page):
+				print("   Found regular CAPTCHA after cooldown. Solving...")
+				if solve_captcha_automatically(page):
+					print("   ✅ CAPTCHA solved after cooldown!")
+					page.wait_for_timeout(2000)
+					return True
+				else:
+					print("   ⚠️  Auto-solve failed. Waiting for manual input...")
+					while is_captcha_page(page):
+						page.wait_for_timeout(5000)
+					print("   ✅ Manual solve detected!")
+					return True
+			else:
+				print("   ✅ Access restored after cooldown!")
+				return True
+		
 		# 1. Go to homepage (safest place to solve)
 		print(f"   Navigating to homepage ({START_URL}) to solve...")
 		page.goto(START_URL, wait_until="commit")
 		page.wait_for_load_state("domcontentloaded")
+		
+		# Check if homepage also shows access restriction
+		if is_access_restricted_page(page):
+			print("   🚫 Homepage also shows access restriction")
+			wait_for_ip_cooldown(page, reason="Access restriction on homepage")
+			page.goto(START_URL, wait_until="commit")
+			page.wait_for_load_state("domcontentloaded")
 		
 		# 2. Solve it
 		if is_captcha_page(page):
@@ -1139,17 +1576,19 @@ def main():
 		else:
 			is_headless = system_os == "Linux"
 			
-		print(f"Running on {system_os}, Headless: {is_headless}")
+		logger.info(f"Running on {system_os}, Headless: {is_headless}")
 
-		browser = p.chromium.launch(
+		logger.info("Launching Firefox browser...")
+		browser = p.firefox.launch(
 			headless=is_headless,
-			channel="chrome",  # Use actual Chrome if available
-			args=get_browser_args()
+			args=get_firefox_launch_args(),
+			firefox_user_prefs=get_firefox_user_prefs()
 		)
 		
+		logger.info("Creating browser context...")
 		context = browser.new_context(
 			viewport={"width": 1920, "height": 1080},
-			user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+			user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0",
 			locale="en-US",
 			timezone_id="America/Toronto",
 			permissions=["geolocation"],
@@ -1157,46 +1596,69 @@ def main():
 		)
 		
 		# Inject all stealth scripts
+		logger.info("Injecting stealth scripts...")
 		for script in get_stealth_scripts():
 			context.add_init_script(script)
 
+		logger.info("Creating new page...")
 		page = context.new_page()
 		
 		# Add random mouse movement to simulate human behavior
 		page.mouse.move(random.randint(100, 500), random.randint(100, 500))
 		
-		page.goto(START_URL, wait_until="load")
+		logger.info(f"Navigating to {START_URL}...")
 		try:
-			page.wait_for_load_state("load", timeout=30000)
-		except:
-			print("Warning: Initial load timeout, proceeding...")
+			page.goto(START_URL, wait_until="domcontentloaded", timeout=60000)
+			logger.info("Navigation completed successfully")
+		except Exception as e:
+			logger.warning(f"Navigation completed with warning: {e}")
+			# Continue anyway - page might still be usable
 		page.wait_for_timeout(WAIT_MS)
 		
 		# Check for CAPTCHA FIRST (DataDome appears before cookie consent)
-		print("\n🔍 Checking for CAPTCHA on initial page...")
-		datadome_detected = is_datadome_captcha(page)
-		canlii_detected = page.locator("#captchaTag").count() > 0
-		print(f"    DataDome CAPTCHA: {'DETECTED' if datadome_detected else 'not found'}")
-		print(f"    CanLII CAPTCHA: {'DETECTED' if canlii_detected else 'not found'}")
+		logger.info("\n🔍 Checking for CAPTCHA on initial page...")
+		try:
+			datadome_detected = is_datadome_captcha(page, silent=True)  # Silent to avoid spam
+			canlii_detected = page.locator("#captchaTag").count() > 0
+			logger.info(f"DataDome CAPTCHA: {'DETECTED' if datadome_detected else 'not found'}")
+			logger.info(f"CanLII CAPTCHA: {'DETECTED' if canlii_detected else 'not found'}")
+		except Exception as e:
+			logger.error(f"Error during CAPTCHA check: {e}")
+			datadome_detected = None
+			canlii_detected = False
 		
 		if datadome_detected or canlii_detected or is_captcha_page(page):
-			print("\n⚠️  CAPTCHA detected on initial page!")
+			logger.warning("\n⚠️  CAPTCHA detected on initial page!")
 			auto_solved = solve_captcha_automatically(page)
 			if not auto_solved:
-				print("    Please solve the CAPTCHA in the browser window...")
+				logger.info("Please solve the CAPTCHA in the browser window...")
 				while is_captcha_page(page):
 					page.wait_for_timeout(5000)
-				print("✅ CAPTCHA solved! Continuing...")
-			page.wait_for_timeout(2000)
-			# Reload the start page after solving CAPTCHA
-			page.goto(START_URL, wait_until="load")
-			try:
-				page.wait_for_load_state("load", timeout=30000)
-			except:
-				pass
+				logger.info("✅ CAPTCHA solved! Continuing...")
+			page.wait_for_timeout(3000)
+			
+			# Wait briefly to see if page auto-reloads
+			logger.info("Waiting for page to stabilize...")
+			page.wait_for_timeout(5000)
+			
+			# Check if we are already on the page with content
+			if page.locator("h2", has_text=SECTION_TITLE).count() > 0:
+				logger.info("Page content appears loaded, skipping reload.")
+			else:
+				logger.info("Reloading page explicitly...")
+				try:
+					page.goto(START_URL, wait_until="commit", timeout=60000)
+					try:
+						page.wait_for_load_state("domcontentloaded", timeout=60000)
+					except:
+						pass
+				except Exception as e:
+					logger.warning(f"Navigation timeout after CAPTCHA, continuing anyway: {e}")
+				
 			page.wait_for_timeout(WAIT_MS)
 		
 		# Handle cookie consent (only after CAPTCHA is solved)
+		logger.info("Checking for cookie banner...")
 		handle_cookie_consent(page)
 		
 		try:
