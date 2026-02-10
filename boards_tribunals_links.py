@@ -1160,8 +1160,14 @@ def process_year_page(page, year_url, board_name, year, tracking_data):
 		
 		save_dir = os.path.join("downloads", board_name, year)
 		
-		for idx, url in enumerate(decision_links):
-			logger.info(f"[{idx+1}/{len(decision_links)}] Processing decision...")
+		# Filter out already processed links to resume directly
+		unprocessed_links = [url for url in decision_links if not is_already_processed(tracking_data, url)]
+		
+		if len(unprocessed_links) < len(decision_links):
+			logger.info(f"⏭️  Skipping {len(decision_links) - len(unprocessed_links)} previously processed documents")
+		
+		for idx, url in enumerate(unprocessed_links):
+			logger.info(f"[{idx+1}/{len(unprocessed_links)}] Processing decision...")
 			process_decision_page(page, url, save_dir, tracking_data)
 			page.wait_for_timeout(500) # Small delay
 			

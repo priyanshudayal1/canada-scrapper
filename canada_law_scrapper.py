@@ -387,23 +387,24 @@ def extract_document_content(page, href="", title=""):
 		
 		# Check for CAPTCHA first
 		if is_captcha_page(page):
-			print("\n⚠️  CAPTCHA DETECTED!")
+			logger.warning("\n⚠️  CAPTCHA DETECTED during content extraction!")
 			
-			# Try automatic solving first
-			auto_solved = solve_captcha_automatically(page)
+			if handle_captcha_interruption(page):
+				logger.info("   🔄 Recovery successful, reloading document...")
+				# Re-navigate to the document URL
+				try:
+					doc_url = f"{BASE_URL}{href}"
+					page.goto(doc_url, wait_until="load")
+					page.wait_for_load_state("domcontentloaded")
+					force_remove_cookie_modal(page)
+				except Exception as nav_e:
+					logger.error(f"   ❌ Failed to reload document after recovery: {nav_e}")
+					return None, None
+			else:
+				logger.error("   ❌ Failed to recover from CAPTCHA. Skipping document.")
+				return None, None
 			
-			if not auto_solved:
-				# Fallback to manual solving
-				print("    Please solve the CAPTCHA in the browser window...")
-				print("    The script will wait for you to solve it...")
-				
-				# Wait for user to solve CAPTCHA (check every 5 seconds)
-				while is_captcha_page(page):
-					page.wait_for_timeout(5000)
-				
-				print("✅ CAPTCHA solved manually! Continuing...\n")
-			
-			# Give page time to load after CAPTCHA
+			# Gives page time to load after recovery
 			page.wait_for_timeout(2000)
 			
 		# Check if document is in force (pass href and title for tracking)
@@ -1799,6 +1800,22 @@ def process_category_page(page, chrome_page, tracking_data, category_url):
 						"url": f"{BASE_URL}{main['href']}",
 						"reason": "Repealed, spent or not in force (marked in category list)"
 					})
+					continue
+				
+				# Check if already processed to resume directly
+				main_key = f"main_{main['href']}"
+				main_processed = is_already_processed(tracking_data, main_key)
+				
+				# Check if all sub-items are processed
+				all_subs_processed = True
+				for sub in sub_items:
+					sub_type = sub.get("type", "sub_item")
+					sub_key = f"{sub_type}_{sub['href']}"
+					if not is_already_processed(tracking_data, sub_key):
+						all_subs_processed = False
+						break
+				
+				if main_processed and all_subs_processed:
 					continue
 				
 				print(f"\n  Processing item {i}/{len(items_to_process)}: {main['title']}")
