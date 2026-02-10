@@ -130,10 +130,7 @@ def wait_for_ip_cooldown(page, reason="access restriction"):
 
 def get_firefox_launch_args():
 	"""Get robust Firefox arguments for evasion"""
-	return [
-		"--width=1920",
-		"--height=1080",
-	]
+	return []
 
 
 def get_firefox_user_prefs():
@@ -314,9 +311,22 @@ def solve_datadome_audio_captcha(page):
 		# Click on audio button to switch to audio mode
 		audio_button = captcha_frame.locator("#captcha__audio__button")
 		if audio_button.count() > 0:
-			logger.info("Clicking audio button...")
-			audio_button.click()
-			page.wait_for_timeout(1500)
+			# Check if already active
+			is_active = False
+			try:
+				if "toggled" in audio_button.get_attribute("class", ""):
+					is_active = True
+				if audio_button.get_attribute("aria-expanded") == "true":
+					is_active = True
+			except:
+				pass
+			
+			if is_active:
+				logger.info("Audio mode already active, skipping click...")
+			else:
+				logger.info("Clicking audio button...")
+				audio_button.click()
+				page.wait_for_timeout(1500)
 		
 		# Wait for audio mode to be active
 		try:
@@ -453,11 +463,16 @@ def solve_canlii_audio_captcha(page):
 			logger.info("Clicking audio toggle button...")
 			try:
 				# Force click to bypass any remaining overlays
-				audio_toggle.click(force=True)
+				audio_toggle.click(force=True, timeout=5000)
 				page.wait_for_timeout(1000)
 			except Exception as e:
-				logger.warning(f"⚠️  Could not click audio toggle: {e}")
-				return False
+				logger.warning(f"⚠️  Click audio toggle failed ({e}). Attempting JS click...")
+				try:
+					page.evaluate("document.getElementById('toggleAudio').click()")
+					page.wait_for_timeout(1000)
+				except Exception as js_e:
+					logger.warning(f"⚠️  JS audio toggle also failed: {js_e}")
+					return False
 			
 		# Re-locate audio tag
 		audio_tag = page.locator("#audioCaptchaTag")
@@ -522,7 +537,12 @@ def solve_canlii_audio_captcha(page):
 		
 		# Submit
 		logger.info("Submitted answer, clicking ok...")
-		page.locator("input[type='submit'][value='ok']").click()
+		try:
+			page.locator("input[type='submit'][value='ok']").click(timeout=5000)
+		except Exception as e:
+			logger.warning(f"⚠️  Submit click failed: {e}. Trying JS...")
+			page.evaluate("document.querySelector('input[type=\"submit\"][value=\"ok\"]').click()")
+		
 		page.wait_for_timeout(3000)
 		
 		if not is_captcha_page(page):
@@ -758,7 +778,16 @@ def solve_captcha_automatically(page):
 			captcha_input.fill(captcha_solution)
 			
 			# Submit the form
-			page.locator("input[type='submit'][value='ok']").click()
+			submit_locator = page.locator("input[type='submit'][value='ok']")
+			try:
+				submit_locator.click(timeout=5000)
+			except Exception as e:
+				logger.warning(f"⚠️  Submit click failed ({e}). Attempting JS click...")
+				try:
+					page.evaluate("document.querySelector('input[type=\"submit\"][value=\"ok\"]').click()")
+				except Exception as js_e:
+					logger.warning(f"⚠️  JS submit also failed: {js_e}")
+			
 			page.wait_for_timeout(3000)
 			
 			# Check if CAPTCHA was solved successfully

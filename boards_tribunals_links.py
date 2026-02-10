@@ -117,8 +117,15 @@ def is_datadome_access_restricted(page):
 				if robot_warning.count() > 0:
 					warning_text = robot_warning.inner_text().lower()
 					if "unusual activity" in warning_text or "automated" in warning_text:
-						logger.warning("🚫 DataDome unusual activity warning detected")
-						return True
+						# check if there are solvable elements
+						audio_btn = frame.locator("#captcha__audio__button")
+						slider = frame.locator(".sliderContainer, #captcha__slider")
+						
+						if audio_btn.count() == 0 and slider.count() == 0:
+							logger.warning("🚫 DataDome unusual activity warning detected (no solvable elements)")
+							return True
+						# If we have solvable elements, ignore the warning text
+
 				# Check if DataDome CAPTCHA container exists but audio button is missing
 				# This indicates an unsolvable access restriction page
 				captcha_container = frame.locator("#captcha-container, .captcha-container")
@@ -166,10 +173,7 @@ def wait_for_ip_cooldown(page, reason="access restriction"):
 
 def get_firefox_launch_args():
 	"""Get robust Firefox arguments for evasion"""
-	return [
-		"--width=1920",
-		"--height=1080",
-	]
+	return []
 
 
 def get_firefox_user_prefs():
@@ -314,9 +318,22 @@ def solve_datadome_audio_captcha(page):
 		# Click on audio button to switch to audio mode
 		audio_button = captcha_frame.locator("#captcha__audio__button")
 		if audio_button.count() > 0:
-			logger.info("Clicking audio button...")
-			audio_button.click()
-			page.wait_for_timeout(1500)
+			# Check if already active
+			is_active = False
+			try:
+				if "toggled" in audio_button.get_attribute("class", ""):
+					is_active = True
+				if audio_button.get_attribute("aria-expanded") == "true":
+					is_active = True
+			except:
+				pass
+			
+			if is_active:
+				logger.info("Audio mode already active, skipping click...")
+			else:
+				logger.info("Clicking audio button...")
+				audio_button.click()
+				page.wait_for_timeout(1500)
 		
 		# Wait for audio mode to be active
 		try:
@@ -453,11 +470,16 @@ def solve_canlii_audio_captcha(page):
 			logger.info("Clicking audio toggle button...")
 			try:
 				# Force click to bypass any remaining overlays
-				audio_toggle.click(force=True)
+				audio_toggle.click(force=True, timeout=5000)
 				page.wait_for_timeout(1000)
 			except Exception as e:
-				logger.warning(f"⚠️  Could not click audio toggle: {e}")
-				return False
+				logger.warning(f"⚠️  Click audio toggle failed ({e}). Attempting JS click...")
+				try:
+					page.evaluate("document.getElementById('toggleAudio').click()")
+					page.wait_for_timeout(1000)
+				except Exception as js_e:
+					logger.warning(f"⚠️  JS audio toggle also failed: {js_e}")
+					return False
 			
 		# Re-locate audio tag
 		audio_tag = page.locator("#audioCaptchaTag")
@@ -522,7 +544,12 @@ def solve_canlii_audio_captcha(page):
 		
 		# Submit
 		logger.info("Submitted answer, clicking ok...")
-		page.locator("input[type='submit'][value='ok']").click()
+		try:
+			page.locator("input[type='submit'][value='ok']").click(timeout=5000)
+		except Exception as e:
+			logger.warning(f"⚠️  Submit click failed: {e}. Trying JS...")
+			page.evaluate("document.querySelector('input[type=\"submit\"][value=\"ok\"]').click()")
+		
 		page.wait_for_timeout(3000)
 		
 		if not is_captcha_page(page):
@@ -758,7 +785,16 @@ def solve_captcha_automatically(page):
 			captcha_input.fill(captcha_solution)
 			
 			# Submit the form
-			page.locator("input[type='submit'][value='ok']").click()
+			submit_locator = page.locator("input[type='submit'][value='ok']")
+			try:
+				submit_locator.click(timeout=5000)
+			except Exception as e:
+				logger.warning(f"⚠️  Submit click failed ({e}). Attempting JS click...")
+				try:
+					page.evaluate("document.querySelector('input[type=\"submit\"][value=\"ok\"]').click()")
+				except Exception as js_e:
+					logger.warning(f"⚠️  JS submit also failed: {js_e}")
+			
 			page.wait_for_timeout(3000)
 			
 			# Check if CAPTCHA was solved successfully
@@ -1207,14 +1243,12 @@ def main():
 			
 		logger.info(f"Running on {system_os}, Headless: {is_headless}")
 		
-		logger.info("Launching Firefox browser...")
 		browser = p.firefox.launch(
 			headless=is_headless,
 			args=get_firefox_launch_args(),
 			firefox_user_prefs=get_firefox_user_prefs()
 		)
 		
-		logger.info("Creating browser context...")
 		context = browser.new_context(
 			viewport={"width": 1920, "height": 1080},
 			user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0",
@@ -1225,35 +1259,22 @@ def main():
 		)
 		
 		# Inject all stealth scripts
-		logger.info("Injecting stealth scripts...")
 		for script in get_stealth_scripts():
 			context.add_init_script(script)
 
-		logger.info("Creating new page...")
 		page = context.new_page()
 		
 		# Add random mouse movement
 		page.mouse.move(random.randint(100, 500), random.randint(100, 500))
 		
-		logger.info(f"Navigating to {START_URL}...")
-		try:
-			page.goto(START_URL, wait_until="domcontentloaded", timeout=60000)
-			logger.info("Navigation completed successfully")
-		except Exception as e:
-			logger.warning(f"Navigation completed with warning: {e}")
-			# Continue anyway - page might still be usable
+		page.goto(START_URL, wait_until="load")
 		
 		# Initial CAPTCHA Check
 		logger.info("\n🔍 Checking for CAPTCHA on initial page...")
-		try:
-			datadome_detected = is_datadome_captcha(page, silent=True)  # Silent to avoid spam
-			canlii_detected = page.locator("#captchaTag").count() > 0
-			logger.info(f"DataDome CAPTCHA: {'DETECTED' if datadome_detected else 'not found'}")
-			logger.info(f"CanLII CAPTCHA: {'DETECTED' if canlii_detected else 'not found'}")
-		except Exception as e:
-			logger.error(f"Error during CAPTCHA check: {e}")
-			datadome_detected = None
-			canlii_detected = False
+		datadome_detected = is_datadome_captcha(page)
+		canlii_detected = page.locator("#captchaTag").count() > 0
+		logger.info(f"DataDome CAPTCHA: {'DETECTED' if datadome_detected else 'not found'}")
+		logger.info(f"CanLII CAPTCHA: {'DETECTED' if canlii_detected else 'not found'}")
 		
 		if datadome_detected or canlii_detected or is_captcha_page(page):
 			logger.warning("\n⚠️  CAPTCHA detected on initial page!")
@@ -1262,7 +1283,7 @@ def main():
 				logger.info("Please solve the CAPTCHA in the browser window...")
 				while is_captcha_page(page):
 					page.wait_for_timeout(5000)
-				print("✅ CAPTCHA solved! Continuing...")
+				logger.info("✅ CAPTCHA solved! Continuing...")
 			page.wait_for_timeout(3000)
 			
 			# Wait briefly to see if page auto-reloads
@@ -1273,7 +1294,7 @@ def main():
 			if page.locator("h2", has_text=SECTION_TITLE).count() > 0:
 				logger.info("Page content appears loaded, skipping reload.")
 			else:
-				print("    Reloading page explicitly...")
+				logger.info("Reloading page explicitly...")
 				try:
 					page.goto(START_URL, wait_until="commit", timeout=60000)
 					try:
@@ -1281,65 +1302,46 @@ def main():
 					except:
 						pass
 				except Exception as e:
-					logger.warning(f"Navigation timeout after CAPTCHA, continuing anyway: {e}")
+					print(f"Warning: Navigation timeout after CAPTCHA, continuing anyway: {e}")
 				
 			page.wait_for_timeout(WAIT_MS)
 
-	# Handle cookie consent with logging
-	logger.info("Checking for cookie banner...")
-	
-	try:
-		if page.locator("#cookieConsentBanner").count() > 0:
-			logger.info("Cookie banner detected")
-			
-			# Try JavaScript click first
-			try:
-				page.evaluate("""
-					const btn = document.getElementById('understandCookieConsent');
-					if (btn) btn.click();
-				""")
-				print("Cookie consent clicked successfully (JavaScript)")
-			except:
-				# Fallback to Playwright click
+		# Handle cookie consent with logging
+		logger.info("Checking for cookie banner...")
+		
+		try:
+			if page.locator("#cookieConsentBanner").count() > 0:
+				logger.info("Cookie banner detected")
 				try:
-					page.click("#understandCookieConsent", timeout=3000)
-					logger.info("Cookie consent clicked successfully (Playwright)")
+					page.evaluate("""
+						const btn = document.getElementById('understandCookieConsent');
+						if (btn) btn.click();
+					""")
+					logger.info("Cookie consent clicked successfully")
 				except:
-					logger.warning("Could not dismiss cookie banner")
-			page.wait_for_timeout(1000)
-		else:
-			logger.info("No cookie banner found")
-	except Exception as e:
-		logger.error(f"Cookie consent handling failed: {e}")
-	
-	try:
-		page.wait_for_load_state("networkidle", timeout=30000)
-		logger.info("Network idle achieved")
-	except Exception as e:
-		logger.warning(f"Network idle timeout (continuing anyway): {e}")
-	
-	page.wait_for_timeout(WAIT_MS)
-	
-	# Collect links
-	logger.info(f"\n=== Collecting {SECTION_TITLE} links ===")
-	links = collect_links(page, SECTION_TITLE)
-	logger.info(f"Found {len(links)} links")
-	
-	if len(links) == 0:
-		logger.warning("⚠️  No links found, checking for CAPTCHA...")
-		if is_captcha_page(page):
-			auto_solved = solve_captcha_automatically(page)
-			
-			if not auto_solved and is_captcha_page(page):
-				logger.info("Please solve the CAPTCHA in the browser window...")
-				while is_captcha_page(page):
-					page.wait_for_timeout(5000)
-				logger.info("✅ CAPTCHA solved! Continuing...")
-				auto_solved = True
-			
-			if auto_solved or len(links) == 0:
+					pass
+				page.wait_for_timeout(1000)
+		except:
+			pass
+		
+		page.wait_for_timeout(WAIT_MS)
+		
+		# Collect links
+		logger.info(f"\n=== Collecting {SECTION_TITLE} links ===")
+		links = collect_links(page, SECTION_TITLE)
+		logger.info(f"Found {len(links)} links")
+		
+		if len(links) == 0:
+			logger.warning("⚠️  No links found, checking for CAPTCHA...")
+			if is_captcha_page(page):
+				auto_solved = solve_captcha_automatically(page)
+				if not auto_solved:
+					logger.info("Please solve the CAPTCHA in the browser window...")
+					while is_captcha_page(page):
+						page.wait_for_timeout(5000)
+					logger.info("✅ CAPTCHA solved! Continuing...")
+				
 				page.wait_for_timeout(3000)
-				# Wait and Reload
 				logger.info("Waiting for page to stabilize...")
 				if page.locator("h2", has_text=SECTION_TITLE).count() > 0:
 					logger.info("Page content appears loaded, skipping reload.")
@@ -1354,10 +1356,7 @@ def main():
 					except Exception as e:
 						logger.warning(f"Navigation timeout after CAPTCHA, continuing anyway: {e}")
 					
-				# Force remove cookie modal
 				force_remove_cookie_modal(page)
-				
-				# Check for CAPTCHA again after potential reload or wait
 				if is_captcha_page(page):
 					logger.info("⚠️  CAPTCHA encountered/persisted, attempting to solve...")
 					if solve_captcha_automatically(page):
@@ -1368,13 +1367,13 @@ def main():
 				page.wait_for_timeout(WAIT_MS)
 				links = collect_links(page, SECTION_TITLE)
 				logger.info(f"Found {len(links)} links after retry")
-	
-	for i, href in enumerate(links, 1):
-		logger.info(f"Visiting link {i}/{len(links)}: {href}")
-		url = f"{BASE_URL}{href}"
-		process_tribunal(page, url, tracking_data)
 		
-	browser.close()
+		for i, href in enumerate(links, 1):
+			logger.info(f"Visiting link {i}/{len(links)}: {href}")
+			url = f"{BASE_URL}{href}"
+			process_tribunal(page, url, tracking_data)
+			
+		browser.close()
 
 
 if __name__ == "__main__":

@@ -16260,6 +16260,13 @@
       "pdf_url": "https://www.canlii.org/en/ca/scc/doc/1993/1993canlii53/1993canlii53.pdf",
       "s3_key": "R. v. Jackson, 1993 CanLII 53 (SCC), [1993] 4 SCR 573.pdf",
       "downloaded_at": "2026-02-02 23:29:09"
+    },
+    {
+      "url": "https://www.canlii.org/en/ca/scc/doc/2026/2026scc4/2026scc4.html",
+      "title": "R. v. Fox, 2026 SCC 4 (CanLII)",
+      "pdf_url": "https://www.canlii.org/en/ca/scc/doc/2026/2026scc4/2026scc4.pdf",
+      "s3_key": "R. v. Fox, 2026 SCC 4 (CanLII).pdf",
+      "downloaded_at": "2026-02-10 12:07:55"
     }
   ]
 }

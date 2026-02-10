@@ -81,21 +81,24 @@ def main():
     # Load tracking files
     courts_data = load_tracking_file("court_tracking.json")
     boards_data = load_tracking_file("boards_tracking.json")
+    legislation_data = load_tracking_file("download_tracking.json")
     
     # Analyze each tracking file
     courts_total = analyze_tracking_data(courts_data, "Courts")
     boards_total = analyze_tracking_data(boards_data, "Boards & Tribunals")
+    legislation_total = analyze_tracking_data(legislation_data, "Legislation")
     
     # Combined summary
-    if courts_total is not None or boards_total is not None:
-        total = (courts_total or 0) + (boards_total or 0)
+    if courts_total is not None or boards_total is not None or legislation_total is not None:
+        total = (courts_total or 0) + (boards_total or 0) + (legislation_total or 0)
         print(f"\n{'='*60}")
         print(f"🎯 Overall Summary")
         print(f"{'='*60}")
         print(f"Courts: {courts_total or 0} documents")
         print(f"Boards & Tribunals: {boards_total or 0} documents")
+        print(f"Legislation: {legislation_total or 0} documents")
         print(f"Total: {total} documents")
-        print(f"{'='*60}\n")
+        print(f"{'='*60}\\n")
     
     # Check for files in S3 vs local
     print("\n💡 Note: This script only counts processed documents from tracking files.")
