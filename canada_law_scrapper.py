@@ -382,6 +382,9 @@ def is_document_in_force(page, href="", title=""):
 def extract_document_content(page, href="", title=""):
 	"""Extract title and structured content from a legislation document page"""
 	try:
+		# Remove cookie modal first to prevent interference
+		force_remove_cookie_modal(page)
+		
 		# Check for CAPTCHA first
 		if is_captcha_page(page):
 			print("\n⚠️  CAPTCHA DETECTED!")
@@ -494,7 +497,8 @@ def is_captcha_page(page):
 def is_datadome_captcha(page, silent=False):
 	"""Check if the current page has a DataDome CAPTCHA, checking all frames"""
 	try:
-		datadome_indicators = [
+		# Primary CAPTCHA-specific indicators (these are definitive)
+		primary_indicators = [
 			"#captcha-container",
 			"#ddv1-captcha-container",
 			"#captcha__frame",
@@ -502,14 +506,12 @@ def is_datadome_captcha(page, silent=False):
 			".captcha__human",
 			".captcha__human__title",
 			"[data-dd-captcha-container]",
-			"text=Verification Required",
-			"text=Slide right to secure your access",
 			".sliderContainer",
 		]
 		
-		# Check main page and all frames
+		# Check main page and all frames for primary indicators
 		for frame in page.frames:
-			for indicator in datadome_indicators:
+			for indicator in primary_indicators:
 				try:
 					if frame.locator(indicator).count() > 0:
 						if not silent:
@@ -517,6 +519,33 @@ def is_datadome_captcha(page, silent=False):
 						return frame
 				except:
 					continue
+		
+		# Secondary check: Only look for text indicators if they appear with CAPTCHA context
+		# Check for "Verification Required" only if it's in a modal/overlay/captcha-like container
+		try:
+			for frame in page.frames:
+				# Check if "Verification Required" exists
+				if frame.locator("text=Verification Required").count() > 0:
+					# Verify it's in a CAPTCHA context by checking for captcha-related parent elements
+					verification_elements = frame.locator("text=Verification Required").all()
+					for elem in verification_elements:
+						try:
+							# Check if this element is inside a captcha-related container
+							parent_html = elem.evaluate("el => el.closest('div')?.outerHTML || ''")
+							if any(keyword in parent_html.lower() for keyword in ['captcha', 'datadome', 'challenge', 'modal', 'overlay']):
+								if not silent:
+									logger.info(f"🔴 DataDome detected via: text=Verification Required (in CAPTCHA context)")
+								return frame
+						except:
+							pass
+				
+				# Check for slider challenge text (this is more specific)
+				if frame.locator("text=Slide right to secure your access").count() > 0:
+					if not silent:
+						logger.info(f"🔴 DataDome detected via: text=Slide right to secure your access")
+					return frame
+		except:
+			pass
 		
 		return None
 	except:
@@ -693,6 +722,7 @@ def force_remove_cookie_modal(page):
 	"""Aggressively remove cookie consent modal and backdrop"""
 	try:
 		page.evaluate("""
+			// Remove by ID
 			const idsToRemove = [
 				'cookieConsentBlocker',
 				'cookieConsentBanner',
@@ -701,13 +731,36 @@ def force_remove_cookie_modal(page):
 			];
 			idsToRemove.forEach(id => {
 				const el = document.getElementById(id);
-				if (el) el.remove();
+				if (el) {
+					el.style.display = 'none';
+					el.remove();
+				}
 			});
-			const backdrops = document.querySelectorAll('.modal-backdrop');
-			backdrops.forEach(el => el.remove());
+			
+			// Remove modal backdrops
+			const backdrops = document.querySelectorAll('.modal-backdrop, [class*="modal"]');
+			backdrops.forEach(el => {
+				if (el.id !== 'main' && !el.querySelector('#docCont')) {
+					el.style.display = 'none';
+					el.remove();
+				}
+			});
+			
+			// Reset body styles
 			document.body.classList.remove('modal-open');
 			document.body.style.overflow = 'auto';
+			document.body.style.paddingRight = '0';
+			
+			// Remove any overlays
+			const overlays = document.querySelectorAll('[style*="z-index"][style*="fixed"], [style*="z-index"][style*="absolute"]');
+			overlays.forEach(el => {
+				if (el.id.includes('cookie') || el.className.includes('cookie') || el.className.includes('modal')) {
+					el.style.display = 'none';
+					el.remove();
+				}
+			});
 		""")
+		page.wait_for_timeout(200)
 	except:
 		pass
 
@@ -1406,32 +1459,49 @@ def create_pdf_from_html(chrome_page, title, content_html, output_path):
 def handle_cookie_consent(page):
 	"""Handle cookie consent banner if it appears"""
 	try:
-		# Try multiple selectors for cookie banner
+		# First, aggressively remove with JavaScript (most reliable)
+		page.evaluate("""
+			const banner = document.getElementById('cookieConsentBanner');
+			if (banner) {
+				banner.style.display = 'none';
+				banner.remove();
+			}
+			const blocker = document.getElementById('cookieConsentBlocker');
+			if (blocker) {
+				blocker.style.display = 'none';
+				blocker.remove();
+			}
+			const modal = document.getElementById('cookieConsentModal');
+			if (modal) {
+				modal.style.display = 'none';
+				modal.remove();
+			}
+			const backdrops = document.querySelectorAll('.modal-backdrop');
+			backdrops.forEach(el => el.remove());
+			document.body.classList.remove('modal-open');
+			document.body.style.overflow = 'auto';
+			document.body.style.paddingRight = '0';
+		""")
+		
+		# Then try clicking accept buttons as backup
 		cookie_selectors = [
 			"#understandCookieConsent",
+			"#acceptAllCookies",
+			"button:has-text('Accept all cookies')",
 			"button:has-text('Accept')",
-			"button:has-text('I understand')",
-			".cookie-accept",
-			"#cookieConsentBanner button"
+			".cookie-accept"
 		]
 		
 		for selector in cookie_selectors:
 			try:
 				if page.locator(selector).count() > 0:
-					page.locator(selector).first.click(timeout=3000)
-					page.wait_for_timeout(1000)
-					return
+					page.locator(selector).first.click(timeout=1000)
+					page.wait_for_timeout(500)
+					break
 			except:
 				continue
 		
-		# Force remove with JavaScript
-		page.evaluate("""
-			const banner = document.getElementById('cookieConsentBanner');
-			if (banner) banner.remove();
-			const blocker = document.getElementById('cookieConsentBlocker');
-			if (blocker) blocker.remove();
-			document.body.style.overflow = 'auto';
-		""")
+		page.wait_for_timeout(200)
 	except:
 		pass
 
@@ -1460,6 +1530,12 @@ def process_legislation_document(page, chrome_page, href, title, citation, prefi
 		except Exception as e:
 			print(f"    ⚠️  Navigation error: {e}")
 			
+		page.wait_for_load_state("domcontentloaded")
+		page.wait_for_timeout(WAIT_MS)
+		
+		# Remove cookie modal immediately after page load
+		force_remove_cookie_modal(page)
+		
 		# Check for CAPTCHA interruption
 		if is_captcha_page(page):
 			print("    ⚠️  CAPTCHA detected on document page!")
@@ -1467,13 +1543,12 @@ def process_legislation_document(page, chrome_page, href, title, citation, prefi
 				print("    🔄 Resuming document processing after recovery...")
 				# Retry navigation
 				page.goto(doc_url, wait_until="load")
+				page.wait_for_load_state("domcontentloaded")
+				force_remove_cookie_modal(page)  # Remove again after recovery
 			else:
 				print("    ❌ Could not recover from CAPTCHA. Skipping this doc.")
 				return False
 
-		page.wait_for_load_state("domcontentloaded")
-		page.wait_for_timeout(WAIT_MS)
-		
 		# Extract content (checks for in-force status inside)
 		doc_title, content_html = extract_document_content(page, href, title)
 		
@@ -1617,6 +1692,9 @@ def extract_row_data(row):
 def process_category_page(page, chrome_page, tracking_data, category_url):
 	"""Process all items in a category page in real-time"""
 	try:
+		# Remove cookie modal first
+		force_remove_cookie_modal(page)
+		
 		# Wait for the table to be populated
 		page.wait_for_selector("#legislationsContainer tr", timeout=10000)
 		
@@ -1794,6 +1872,9 @@ def main():
 			# Continue anyway - page might still be usable
 		page.wait_for_timeout(WAIT_MS)
 		
+		# Remove cookie modal immediately after initial navigation
+		force_remove_cookie_modal(page)
+		
 		# Check for CAPTCHA FIRST (DataDome appears before cookie consent)
 		logger.info("\n🔍 Checking for CAPTCHA on initial page...")
 		try:
@@ -1835,6 +1916,9 @@ def main():
 					logger.warning(f"Navigation timeout after CAPTCHA, continuing anyway: {e}")
 				
 			page.wait_for_timeout(WAIT_MS)
+			
+			# Remove cookie modal again after CAPTCHA solving
+			force_remove_cookie_modal(page)
 		
 		# Handle cookie consent (only after CAPTCHA is solved)
 		logger.info("Checking for cookie banner...")
@@ -1886,6 +1970,9 @@ def main():
 				pass
 			page.wait_for_timeout(WAIT_MS)
 			
+			# Remove cookie modal after category navigation
+			force_remove_cookie_modal(page)
+			
 			# Check for CAPTCHA when entering category page
 			if is_captcha_page(page):
 				print("⚠️  CAPTCHA detected on category page!")
@@ -1900,6 +1987,8 @@ def main():
 				page.goto(category_url, wait_until="load")
 				page.wait_for_load_state("networkidle")
 				page.wait_for_timeout(WAIT_MS)
+				# Remove cookie modal after reload
+				force_remove_cookie_modal(page)
 			
 			# Process all items in this category immediately
 			count = process_category_page(page, chrome_page, tracking_data, category_url)
