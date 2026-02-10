@@ -120,12 +120,10 @@ def wait_for_ip_cooldown(page, reason="access restriction"):
 	logger.info(f"Resume time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time() + wait_seconds))}")
 	logger.warning("="*60 + "\n")
 	
-	# Wait with countdown updates every minute
+	# Use time.sleep instead of page.wait_for_timeout to avoid browser timeout
 	for remaining_minutes in range(wait_minutes, 0, -1):
 		print(f"    ⏳ {remaining_minutes} minute(s) remaining...")
-		# Wait 1 minute (60 seconds)
-		for _ in range(12):  # 12 * 5 seconds = 60 seconds
-			page.wait_for_timeout(5000)
+		time.sleep(60)  # Sleep for 1 minute
 	
 	logger.info("\n" + "="*60)
 	logger.info("✅ IP COOLDOWN COMPLETE - Resuming operations")
