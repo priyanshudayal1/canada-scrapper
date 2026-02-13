@@ -1836,6 +1836,22 @@ def process_category_page(page, chrome_page, tracking_data, category_url):
 				page.wait_for_load_state("networkidle")
 				page.wait_for_timeout(1000)
 				
+				# Check for CAPTCHA after returning to category page
+				if is_captcha_page(page):
+					print("    ⚠️  CAPTCHA detected after returning to category page!")
+					if handle_captcha_interruption(page):
+						print("    🔄 Resuming category page processing after recovery...")
+						page.goto(category_url, wait_until="load")
+						page.wait_for_load_state("networkidle")
+						force_remove_cookie_modal(page)
+					else:
+						print("    ❌ Could not recover from CAPTCHA. Please solve manually...")
+						while is_captcha_page(page):
+							page.wait_for_timeout(5000)
+						page.goto(category_url, wait_until="load")
+						page.wait_for_load_state("networkidle")
+					page.wait_for_timeout(1000)
+				
 			except Exception as e:
 				print(f"  Error processing item {i}: {e}")
 				# Try to recover by navigating back to category page
@@ -1843,6 +1859,20 @@ def process_category_page(page, chrome_page, tracking_data, category_url):
 					page.goto(category_url, wait_until="load")
 					page.wait_for_load_state("networkidle")
 					page.wait_for_timeout(1000)
+					
+					# Check for CAPTCHA after error recovery navigation
+					if is_captcha_page(page):
+						print("    ⚠️  CAPTCHA detected during error recovery!")
+						if handle_captcha_interruption(page):
+							page.goto(category_url, wait_until="load")
+							page.wait_for_load_state("networkidle")
+						else:
+							print("    ❌ Waiting for manual CAPTCHA solve...")
+							while is_captcha_page(page):
+								page.wait_for_timeout(5000)
+							page.goto(category_url, wait_until="load")
+							page.wait_for_load_state("networkidle")
+						page.wait_for_timeout(1000)
 				except:
 					pass
 				continue
