@@ -43,8 +43,10 @@ BEDROCK_REGION = os.getenv("AWS_REGION", "us-east-1")
 MAX_CAPTCHA_ATTEMPTS = 50  # Maximum attempts to solve CAPTCHA
 
 # Access restriction cooldown settings
-ACCESS_RESTRICTED_WAIT_MIN = 10  # Minimum wait time in minutes
-ACCESS_RESTRICTED_WAIT_MAX = 20  # Maximum wait time in minutes
+ACCESS_RESTRICTED_WAIT_MIN = 25  # Minimum wait time in minutes (base time)
+ACCESS_RESTRICTED_WAIT_MAX = 35  # Maximum wait time in minutes (base time)
+# For consecutive cooldowns, wait time is multiplied by attempt number
+# Example: attempt=1: 25-35min, attempt=2: 50-70min, attempt=3: 75-105min
 
 
 
@@ -106,15 +108,25 @@ def is_access_restricted_page(page):
 		return False
 
 
-def wait_for_ip_cooldown(page, reason="access restriction"):
-	"""Wait for 10-20 minutes to let IP restriction clear"""
-	wait_minutes = random.randint(ACCESS_RESTRICTED_WAIT_MIN, ACCESS_RESTRICTED_WAIT_MAX)
+def wait_for_ip_cooldown(page, reason="access restriction", attempt=1):
+	"""Wait for IP restriction to clear with exponential backoff
+	
+	Args:
+		page: Playwright page object
+		reason: Reason for the cooldown (for logging)
+		attempt: Cooldown attempt number (1, 2, 3...) - multiplies wait time
+	"""
+	# Calculate wait time with exponential backoff
+	base_wait_minutes = random.randint(ACCESS_RESTRICTED_WAIT_MIN, ACCESS_RESTRICTED_WAIT_MAX)
+	wait_minutes = base_wait_minutes * attempt  # Multiply by attempt number
 	wait_seconds = wait_minutes * 60
 	
 	logger.warning("\n" + "="*60)
 	logger.warning("🚫 ACCESS RESTRICTED - IP COOLDOWN REQUIRED")
 	logger.warning("="*60)
 	logger.warning(f"Reason: {reason}")
+	if attempt > 1:
+		logger.warning(f"Consecutive cooldown attempt #{attempt} - Using {attempt}x wait time")
 	logger.info(f"Waiting for {wait_minutes} minutes to let IP restriction clear...")
 	logger.info(f"Start time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
 	logger.info(f"Resume time: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time() + wait_seconds))}")
@@ -1029,17 +1041,25 @@ def solve_captcha_automatically(page):
 		if is_datadome_access_restricted(page):
 			logger.warning("🚫 This is a DataDome ACCESS RESTRICTED page - NOT a solvable CAPTCHA!")
 			logger.warning("🚫 IP has been rate-limited. Triggering cooldown...")
-			wait_for_ip_cooldown(page, reason="DataDome Access Restricted - IP rate-limited after high download volume")
+			wait_for_ip_cooldown(page, reason="DataDome Access Restricted - IP rate-limited after high download volume", attempt=1)
 			# After cooldown, check if access is restored
 			page.goto(START_URL, wait_until="commit")
 			page.wait_for_load_state("domcontentloaded")
 			page.wait_for_timeout(3000)
 			# Check again - might need another cooldown or regular CAPTCHA
 			if is_datadome_access_restricted(page):
-				logger.warning("⚠️  Still access restricted after cooldown, waiting again...")
-				wait_for_ip_cooldown(page, reason="Still access restricted after first cooldown")
+				logger.warning("⚠️  Still access restricted after cooldown, using 2x wait time...")
+				wait_for_ip_cooldown(page, reason="Still access restricted after first cooldown", attempt=2)
 				page.goto(START_URL, wait_until="commit")
 				page.wait_for_load_state("domcontentloaded")
+				page.wait_for_timeout(3000)
+				# Check third time
+				if is_datadome_access_restricted(page):
+					logger.error("❌ Still restricted after 2 cooldowns. IP may be banned for extended period.")
+					logger.error("Waiting one more time with 3x multiplier...")
+					wait_for_ip_cooldown(page, reason="Third consecutive cooldown - possible long-term ban", attempt=3)
+					page.goto(START_URL, wait_until="commit")
+					page.wait_for_load_state("domcontentloaded")
 			# Now check if there's a regular CAPTCHA or if we're clear
 			if not is_captcha_page(page):
 				logger.info("✅ Access restored after cooldown!")
@@ -1062,7 +1082,7 @@ def solve_captcha_automatically(page):
 					logger.warning("🚫 Too many consecutive timeouts - checking if this is actually Access Restricted...")
 					if is_datadome_access_restricted(page):
 						logger.warning("🚫 Confirmed: This is Access Restricted, not a solvable CAPTCHA!")
-						wait_for_ip_cooldown(page, reason="DataDome Access Restricted detected after timeout pattern")
+						wait_for_ip_cooldown(page, reason="DataDome Access Restricted detected after timeout pattern", attempt=1)
 						page.goto(START_URL, wait_until="commit")
 						page.wait_for_load_state("domcontentloaded")
 						return solve_captcha_automatically(page)
@@ -1075,7 +1095,7 @@ def solve_captcha_automatically(page):
 			# Check if it became access restricted during attempts
 			if is_datadome_access_restricted(page):
 				logger.warning("🚫 CAPTCHA attempts triggered access restriction!")
-				wait_for_ip_cooldown(page, reason="Access restricted after CAPTCHA solve attempts")
+				wait_for_ip_cooldown(page, reason="Access restricted after CAPTCHA solve attempts", attempt=1)
 				page.goto(START_URL, wait_until="commit")
 				page.wait_for_load_state("domcontentloaded")
 				return solve_captcha_automatically(page)
@@ -1190,17 +1210,17 @@ def handle_captcha_interruption(page):
 		# Check for DataDome "Access Restricted" variant FIRST (inside iframe)
 		if is_datadome_access_restricted(page):
 			logger.warning("🚫 DataDome ACCESS RESTRICTED detected - IP rate-limited!")
-			wait_for_ip_cooldown(page, reason="DataDome Access Restricted during scraping")
+			wait_for_ip_cooldown(page, reason="DataDome Access Restricted during scraping", attempt=1)
 			
 			# After waiting, go to homepage and check again
 			logger.info(f"Navigating to homepage ({START_URL}) after cooldown...")
 			page.goto(START_URL, wait_until="commit")
 			page.wait_for_load_state("domcontentloaded")
 			
-			# If still restricted after waiting, wait again
+			# If still restricted after waiting, wait again with 2x multiplier
 			if is_datadome_access_restricted(page):
-				logger.warning("⚠️  Still access restricted after first cooldown, waiting again...")
-				wait_for_ip_cooldown(page, reason="DataDome still restricted after first cooldown")
+				logger.warning("⚠️  Still access restricted after first cooldown, using 2x wait time...")
+				wait_for_ip_cooldown(page, reason="DataDome still restricted after first cooldown", attempt=2)
 				page.goto(START_URL, wait_until="commit")
 				page.wait_for_load_state("domcontentloaded")
 			
@@ -1224,17 +1244,17 @@ def handle_captcha_interruption(page):
 		# Check for regular access restriction (main page body)
 		if is_access_restricted_page(page):
 			print("   🚫 Access restriction detected - IP may be blocked due to high download volume")
-			wait_for_ip_cooldown(page, reason="Access restriction detected during scraping")
+			wait_for_ip_cooldown(page, reason="Access restriction detected during scraping", attempt=1)
 			
 			# After waiting, go to homepage and check again
 			print(f"   Navigating to homepage ({START_URL}) after cooldown...")
 			page.goto(START_URL, wait_until="commit")
 			page.wait_for_load_state("domcontentloaded")
 			
-			# If still restricted after waiting, wait again
+			# If still restricted after waiting, wait again with 2x multiplier
 			if is_access_restricted_page(page):
-				print("   ⚠️  Still restricted after first cooldown, waiting again...")
-				wait_for_ip_cooldown(page, reason="Access still restricted after first cooldown")
+				print("   ⚠️  Still restricted after first cooldown, using 2x wait time...")
+				wait_for_ip_cooldown(page, reason="Access still restricted after first cooldown", attempt=2)
 				page.goto(START_URL, wait_until="commit")
 				page.wait_for_load_state("domcontentloaded")
 			
@@ -1263,7 +1283,7 @@ def handle_captcha_interruption(page):
 		# Check if homepage also shows access restriction
 		if is_access_restricted_page(page):
 			print("   🚫 Homepage also shows access restriction")
-			wait_for_ip_cooldown(page, reason="Access restriction on homepage")
+			wait_for_ip_cooldown(page, reason="Access restriction on homepage", attempt=1)
 			page.goto(START_URL, wait_until="commit")
 			page.wait_for_load_state("domcontentloaded")
 		
