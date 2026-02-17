@@ -2460,6 +2460,261 @@ def process_consolidated_statutes(page, chrome_page, tracking_data):
 		return 0
 
 
+def process_annual_statutes(page, chrome_page, tracking_data):
+	"""Process Annual Statutes category - year-based legislation"""
+	category_url = f"{BASE_URL}/ca/laws/astat"
+	category_name = "Annual Statutes"
+	
+	print(f"\n{'='*80}")
+	print(f"PROCESSING: {category_name}")
+	print(f"URL: {category_url}")
+	print(f"{'='*80}\n")
+	
+	try:
+		# Navigate to the category page
+		page.goto(category_url, wait_until="load")
+		page.wait_for_load_state("networkidle")
+		page.wait_for_timeout(2000)
+		force_remove_cookie_modal(page)
+		
+		# Check for CAPTCHA
+		if is_captcha_page(page):
+			print("⚠️  CAPTCHA detected on Annual Statutes page!")
+			if handle_captcha_interruption(page):
+				page.goto(category_url, wait_until="load")
+				page.wait_for_load_state("networkidle")
+			else:
+				print("Please solve CAPTCHA manually...")
+				while is_captcha_page(page):
+					page.wait_for_timeout(5000)
+				page.goto(category_url, wait_until="load")
+				page.wait_for_load_state("networkidle")
+		
+		# Wait for table to load
+		page.wait_for_selector("#filterableList tbody tr", timeout=15000)
+		print(f"✓ {category_name} table loaded")
+		
+		# Click "Show more results" until all items are loaded
+		print("Loading all results (clicking 'Show more results')...")
+		click_count = 0
+		while True:
+			try:
+				show_more = page.locator("span.showMoreResults")
+				if show_more.count() > 0 and show_more.is_visible():
+					click_count += 1
+					print(f"  Clicking 'Show more results' (click #{click_count})...")
+					show_more.click()
+					page.wait_for_timeout(2000)
+					
+					# Check for CAPTCHA during pagination
+					if is_captcha_page(page):
+						print("⚠️  CAPTCHA detected during pagination!")
+						if handle_captcha_interruption(page):
+							page.goto(category_url, wait_until="load")
+							page.wait_for_load_state("networkidle")
+							page.wait_for_timeout(2000)
+						else:
+							print("Please solve CAPTCHA manually...")
+							while is_captcha_page(page):
+								page.wait_for_timeout(5000)
+							page.goto(category_url, wait_until="load")
+							page.wait_for_load_state("networkidle")
+							page.wait_for_timeout(2000)
+				else:
+					break
+			except Exception as e:
+				print(f"  No more results to load (or error: {e})")
+				break
+		
+		print(f"✓ All results loaded after {click_count} pagination clicks")
+		
+		# Collect all document data first (before navigation)
+		all_documents = []
+		rows = page.locator("#filterableList tbody tr").all()
+		print(f"Found {len(rows)} rows in {category_name}")
+		
+		for idx, row in enumerate(rows, 1):
+			if idx % 50 == 0:
+				print(f"  Parsing row {idx}/{len(rows)}...")
+			
+			try:
+				# Extract main document info
+				citation_cell = row.locator("td").nth(0)
+				title_cell = row.locator("td").nth(1)
+				
+				citation = citation_cell.inner_text().strip()
+				
+				# Get the main span wrapper
+				main_span = title_cell.locator("span.d-flex").first
+				if main_span.count() == 0:
+					continue
+				
+				# Get the main link
+				main_link = main_span.locator("a.canlii").first
+				if main_link.count() == 0:
+					continue
+					
+				main_href = main_link.get_attribute("href")
+				main_title = main_link.inner_text().strip()
+				
+				# Extract bill info if present (e.g., "Bill C-40, assented to 2024-12-17")
+				bill_info = ""
+				bill_span = main_span.locator("span").nth(1)
+				if bill_span.count() > 0:
+					bill_info = bill_span.inner_text().strip()
+				
+				doc_info = {
+					"citation": citation,
+					"href": main_href,
+					"title": main_title,
+					"bill_info": bill_info,
+					"amended_statutes": [],
+					"amended_regulations": []
+				}
+				
+				# Check if row has expandable amendments
+				amendment_toggle = title_cell.locator("a.pointer.text-nowrap")
+				if amendment_toggle.count() > 0:
+					# Click to expand
+					try:
+						amendment_toggle.click()
+						page.wait_for_timeout(300)
+					except Exception as e:
+						pass
+					
+					# Parse the expanded amendments div (uses 'legislation_' prefix, not 'regulation_')
+					amendment_div = title_cell.locator("div[id^='legislation_']").first
+					if amendment_div.count() > 0 and amendment_div.is_visible():
+						# Iterate through children and track which section we're in
+						children = amendment_div.locator("> *").all()
+						current_section = None
+						
+						for child in children:
+							tag_name = child.evaluate("el => el.tagName.toLowerCase()")
+							
+							if tag_name == "div":
+								# Section header
+								section_text = child.inner_text().lower().strip()
+								
+								if "amended statutes" in section_text:
+									current_section = "amended_statutes"
+								elif "amended regulations" in section_text:
+									current_section = "amended_regulations"
+							
+							elif tag_name == "ul":
+								# Process list based on current section
+								items = child.locator("li").all()
+								for item in items:
+									link = item.locator("a").first
+									if link.count() > 0:
+										ref_href = link.get_attribute("href")
+										ref_title = link.inner_text().strip()
+										ref_citation_span = item.locator("span.nowrap")
+										ref_citation = ref_citation_span.inner_text().strip() if ref_citation_span.count() > 0 else ""
+										
+										ref_data = {
+											"href": ref_href,
+											"title": ref_title,
+											"citation": ref_citation
+										}
+										
+										if current_section == "amended_statutes":
+											doc_info["amended_statutes"].append(ref_data)
+										elif current_section == "amended_regulations":
+											doc_info["amended_regulations"].append(ref_data)
+				
+				all_documents.append(doc_info)
+				
+			except Exception as e:
+				print(f"  ⚠️  Error extracting row {idx}: {e}")
+				continue
+		
+		print(f"\n✓ Collected {len(all_documents)} annual statutes")
+		total_amended_statutes = sum(len(doc["amended_statutes"]) for doc in all_documents)
+		total_amended_regulations = sum(len(doc["amended_regulations"]) for doc in all_documents)
+		
+		print(f"✓ References {total_amended_statutes} amended statutes (not downloaded - covered in Consolidated Statutes)")
+		print(f"✓ References {total_amended_regulations} amended regulations (not downloaded - covered in Regulations)\n")
+		
+		# Now process each document - only download the main annual statute
+		processed_count = 0
+		
+		for idx, doc in enumerate(all_documents, 1):
+			if idx % 50 == 0:
+				print(f"\n[Progress: {idx}/{len(all_documents)}]")
+			
+			try:
+				main_key = f"main_{doc['href']}"
+				
+				# Check if already processed
+				if is_already_processed(tracking_data, main_key):
+					if idx % 50 == 0:  # Only log for progress updates
+						print(f"[{idx}/{len(all_documents)}] ⏭️  {doc['title']}")
+					continue
+				
+				# Process the annual statute
+				print(f"\n[{idx}/{len(all_documents)}] Processing: {doc['title']}")
+				if doc['bill_info']:
+					print(f"  {doc['bill_info']}")
+				
+				# Log amendments for reference (but don't download them)
+				if doc['amended_statutes']:
+					print(f"  ℹ️  Amends {len(doc['amended_statutes'])} statute(s):")
+					for stat in doc['amended_statutes'][:3]:  # Show first 3
+						print(f"    • {stat['title']}")
+					if len(doc['amended_statutes']) > 3:
+						print(f"    • ... and {len(doc['amended_statutes']) - 3} more")
+				
+				if doc['amended_regulations']:
+					print(f"  ℹ️  Amends {len(doc['amended_regulations'])} regulation(s)")
+				
+				# Download only the main annual statute
+				if process_legislation_document(page, chrome_page, doc["href"], doc["title"], doc["citation"], "main", tracking_data):
+					processed_count += 1
+				
+				# Return to category page after processing
+				page.goto(category_url, wait_until="load")
+				page.wait_for_load_state("networkidle")
+				page.wait_for_timeout(800)
+				
+				# Check for CAPTCHA after returning
+				if is_captcha_page(page):
+					print("    ⚠️  CAPTCHA detected after returning!")
+					if handle_captcha_interruption(page):
+						page.goto(category_url, wait_until="load")
+						page.wait_for_load_state("networkidle")
+					else:
+						print("    Please solve CAPTCHA manually...")
+						while is_captcha_page(page):
+							page.wait_for_timeout(5000)
+						page.goto(category_url, wait_until="load")
+						page.wait_for_load_state("networkidle")
+				
+			except Exception as e:
+				print(f"  ⚠️  Error processing document {idx}: {e}")
+				# Try to recover
+				try:
+					page.goto(category_url, wait_until="load")
+					page.wait_for_load_state("networkidle")
+					page.wait_for_timeout(1000)
+				except:
+					pass
+				continue
+		
+		print(f"\n{'='*80}")
+		print(f"✓ {category_name} COMPLETE")
+		print(f"  Downloaded: {processed_count} annual statutes")
+		print(f"{'='*80}\n")
+		
+		return processed_count
+		
+	except Exception as e:
+		print(f"\n❌ Error processing {category_name}: {e}")
+		import traceback
+		traceback.print_exc()
+		return 0
+
+
 def main():
 	# Create output directory
 	os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -2593,33 +2848,39 @@ def main():
 		print("\nCategories to process:")
 		print("  1. Constitutional Acts")
 		print("  2. Consolidated Statutes")
-		print("  3. Annual Statutes (TODO)")
+		print("  3. Annual Statutes")
 		print("  4. Regulations (TODO)")
 		print("="*80 + "\n")
 		
 		# Category 1: Constitutional Acts
+		# try:
+		# 	count = process_constitutional_acts(page, chrome_page, tracking_data)
+		# 	total_processed += count
+		# except Exception as e:
+		# 	print(f"\n❌ Failed to process Constitutional Acts: {e}")
+		# 	import traceback
+		# 	traceback.print_exc()
+		
+		# # Category 2: Consolidated Statutes
+		# try:
+		# 	count = process_consolidated_statutes(page, chrome_page, tracking_data)
+		# 	total_processed += count
+		# except Exception as e:
+		# 	print(f"\n❌ Failed to process Consolidated Statutes: {e}")
+		# 	import traceback
+		# 	traceback.print_exc()
+		
+		# Category 3: Annual Statutes
 		try:
-			count = process_constitutional_acts(page, chrome_page, tracking_data)
+			count = process_annual_statutes(page, chrome_page, tracking_data)
 			total_processed += count
 		except Exception as e:
-			print(f"\n❌ Failed to process Constitutional Acts: {e}")
+			print(f"\n❌ Failed to process Annual Statutes: {e}")
 			import traceback
 			traceback.print_exc()
-		
-		# Category 2: Consolidated Statutes
-		try:
-			count = process_consolidated_statutes(page, chrome_page, tracking_data)
-			total_processed += count
-		except Exception as e:
-			print(f"\n❌ Failed to process Consolidated Statutes: {e}")
-			import traceback
-			traceback.print_exc()
-		
-		# Category 3: Annual Statutes (TODO - to be implemented)
-		print("\n⏭️  Annual Statutes - NOT YET IMPLEMENTED")
 		
 		# Category 4: Regulations (TODO - to be implemented)
-		print("⏭️  Regulations - NOT YET IMPLEMENTED\n")
+		print("\n⏭️  Regulations - NOT YET IMPLEMENTED\n")
 		
 		print("\n" + "="*80)
 		print("SCRAPING COMPLETE")
