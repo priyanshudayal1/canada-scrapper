@@ -2715,6 +2715,251 @@ def process_annual_statutes(page, chrome_page, tracking_data):
 		return 0
 
 
+def process_regulations(page, chrome_page, tracking_data):
+	"""Process Regulations category - largest dataset with 5000+ regulations"""
+	category_url = f"{BASE_URL}/ca/laws/regu"
+	category_name = "Regulations"
+	
+	print(f"\n{'='*80}")
+	print(f"PROCESSING: {category_name}")
+	print(f"URL: {category_url}")
+	print(f"{'='*80}\n")
+	
+	try:
+		# Navigate to the category page
+		page.goto(category_url, wait_until="load")
+		page.wait_for_load_state("networkidle")
+		page.wait_for_timeout(2000)
+		force_remove_cookie_modal(page)
+		
+		# Check for CAPTCHA
+		if is_captcha_page(page):
+			print("⚠️  CAPTCHA detected on Regulations page!")
+			if handle_captcha_interruption(page):
+				page.goto(category_url, wait_until="load")
+				page.wait_for_load_state("networkidle")
+			else:
+				print("Please solve CAPTCHA manually...")
+				while is_captcha_page(page):
+					page.wait_for_timeout(5000)
+				page.goto(category_url, wait_until="load")
+				page.wait_for_load_state("networkidle")
+		
+		# Wait for table to load
+		page.wait_for_selector("#filterableList tbody tr", timeout=15000)
+		print(f"✓ {category_name} table loaded")
+		
+		# Click "Show more results" until all items are loaded
+		print("Loading all results (clicking 'Show more results')...")
+		click_count = 0
+		while True:
+			try:
+				show_more = page.locator("span.showMoreResults")
+				if show_more.count() > 0 and show_more.is_visible():
+					click_count += 1
+					print(f"  Clicking 'Show more results' (click #{click_count})...")
+					show_more.click()
+					page.wait_for_timeout(2000)
+					
+					# Check for CAPTCHA during pagination
+					if is_captcha_page(page):
+						print("⚠️  CAPTCHA detected during pagination!")
+						if handle_captcha_interruption(page):
+							page.goto(category_url, wait_until="load")
+							page.wait_for_load_state("networkidle")
+							page.wait_for_timeout(2000)
+						else:
+							print("Please solve CAPTCHA manually...")
+							while is_captcha_page(page):
+								page.wait_for_timeout(5000)
+							page.goto(category_url, wait_until="load")
+							page.wait_for_load_state("networkidle")
+							page.wait_for_timeout(2000)
+				else:
+					break
+			except Exception as e:
+				print(f"  No more results to load (or error: {e})")
+				break
+		
+		print(f"✓ All results loaded after {click_count} pagination clicks")
+		
+		# Collect all document data first (before navigation)
+		all_regulations = []
+		rows = page.locator("#filterableList tbody tr").all()
+		print(f"Found {len(rows)} rows in {category_name}")
+		
+		for idx, row in enumerate(rows, 1):
+			if idx % 100 == 0:
+				print(f"  Parsing row {idx}/{len(rows)}...")
+			
+			try:
+				# Extract regulation info from first column
+				first_td = row.locator("td").nth(0)
+				
+				# Get the main regulation link
+				main_link = first_td.locator("a.canlii").first
+				if main_link.count() == 0:
+					continue
+					
+				reg_href = main_link.get_attribute("href")
+				reg_title = main_link.inner_text().strip()
+				
+				# Get citation from nowrap span
+				citation_span = first_td.locator("span.nowrap").first
+				reg_citation = citation_span.inner_text().strip() if citation_span.count() > 0 else ""
+				
+				# Check if regulation is repealed
+				is_repealed = False
+				repealed_spans = first_td.locator("span").all()
+				for span in repealed_spans:
+					span_text = span.inner_text().lower()
+					if "repealed" in span_text or "spent" in span_text or "not in force" in span_text:
+						is_repealed = True
+						break
+				
+				# Extract enabling statute info from second column (for reference, not download)
+				second_td = row.locator("td").nth(1)
+				enabling_statute = None
+				if second_td.count() > 0:
+					enabling_link = second_td.locator("a").first
+					if enabling_link.count() > 0:
+						enabling_href = enabling_link.get_attribute("href")
+						enabling_title = enabling_link.inner_text().strip()
+						enabling_citation_span = second_td.locator("span.nowrap").first
+						enabling_citation = enabling_citation_span.inner_text().strip() if enabling_citation_span.count() > 0 else ""
+						
+						enabling_statute = {
+							"href": enabling_href,
+							"title": enabling_title,
+							"citation": enabling_citation
+						}
+				
+				reg_info = {
+					"href": reg_href,
+					"title": reg_title,
+					"citation": reg_citation,
+					"is_repealed": is_repealed,
+					"enabling_statute": enabling_statute
+				}
+				
+				all_regulations.append(reg_info)
+				
+			except Exception as e:
+				print(f"  ⚠️  Error extracting row {idx}: {e}")
+				continue
+		
+		print(f"\n✓ Collected {len(all_regulations)} regulations")
+		repealed_count = sum(1 for reg in all_regulations if reg["is_repealed"])
+		active_count = len(all_regulations) - repealed_count
+		print(f"✓ Active regulations: {active_count}")
+		print(f"✓ Repealed regulations: {repealed_count} (will be deleted from S3 if present)\n")
+		
+		# Now process each regulation
+		processed_count = 0
+		deleted_count = 0
+		skipped_repealed = 0
+		skipped_already_done = 0
+		
+		for idx, reg in enumerate(all_regulations, 1):
+			if idx % 100 == 0:
+				print(f"\n[Progress: {idx}/{len(all_regulations)} | Downloaded: {processed_count} | Deleted: {deleted_count} | Skipped: {skipped_repealed + skipped_already_done}]")
+			
+			try:
+				reg_key = f"sub_item_{reg['href']}"
+				safe_filename = sanitize_filename(f"{reg['citation']}_{reg['title']}"[:150]) if reg['citation'] else sanitize_filename(f"{reg['title']}"[:150])
+				reg_s3_key = f"{safe_filename}.pdf"
+				
+				# Handle repealed regulations - delete from S3 and remove from tracking
+				if reg['is_repealed']:
+					skipped_repealed += 1
+					
+					# Only show details if it was previously processed (needs deletion)
+					was_processed = is_already_processed(tracking_data, reg_key)
+					
+					if was_processed:
+						print(f"\n[{idx}/{len(all_regulations)}] 🗑️  REPEALED: {reg['title']}")
+						
+						# Delete from S3 if exists
+						if delete_from_s3(reg_s3_key):
+							deleted_count += 1
+						
+						# Remove from tracking
+						remove_from_processed(tracking_data, reg_key)
+					elif idx % 100 == 0:  # Only log at progress intervals if not previously processed
+						print(f"[{idx}] ⏭️  Skipped (repealed, never downloaded): {reg['title']}")
+					
+					# Save to skipped file
+					save_skipped_document({
+						"title": reg["title"],
+						"href": reg["href"],
+						"url": f"{BASE_URL}{reg['href']}",
+						"citation": reg["citation"],
+						"reason": "Repealed, spent or not in force"
+					})
+					continue
+				
+				# Check if already processed
+				if is_already_processed(tracking_data, reg_key):
+					skipped_already_done += 1
+					if idx % 100 == 0:  # Only log at progress intervals
+						print(f"[{idx}] ⏭️  Already done: {reg['title']}")
+					continue
+				
+				# Process the regulation
+				print(f"\n[{idx}/{len(all_regulations)}] Processing: {reg['title']}")
+				if reg['enabling_statute']:
+					print(f"  ℹ️  Enabled by: {reg['enabling_statute']['title']}")
+				
+				# Download only the regulation (not the enabling statute)
+				if process_legislation_document(page, chrome_page, reg["href"], reg["title"], reg["citation"], "sub_item", tracking_data):
+					processed_count += 1
+				
+				# Return to category page after processing
+				page.goto(category_url, wait_until="load")
+				page.wait_for_load_state("networkidle")
+				page.wait_for_timeout(800)
+				
+				# Check for CAPTCHA after returning
+				if is_captcha_page(page):
+					print("    ⚠️  CAPTCHA detected after returning!")
+					if handle_captcha_interruption(page):
+						page.goto(category_url, wait_until="load")
+						page.wait_for_load_state("networkidle")
+					else:
+						print("    Please solve CAPTCHA manually...")
+						while is_captcha_page(page):
+							page.wait_for_timeout(5000)
+						page.goto(category_url, wait_until="load")
+						page.wait_for_load_state("networkidle")
+				
+			except Exception as e:
+				print(f"  ⚠️  Error processing regulation {idx}: {e}")
+				# Try to recover
+				try:
+					page.goto(category_url, wait_until="load")
+					page.wait_for_load_state("networkidle")
+					page.wait_for_timeout(1000)
+				except:
+					pass
+				continue
+		
+		print(f"\n{'='*80}")
+		print(f"✓ {category_name} COMPLETE")
+		print(f"  Downloaded: {processed_count} regulations")
+		print(f"  Deleted (repealed): {deleted_count} regulations")
+		print(f"  Skipped (repealed, never downloaded): {skipped_repealed - deleted_count}")
+		print(f"  Skipped (already done): {skipped_already_done}")
+		print(f"{'='*80}\n")
+		
+		return processed_count
+		
+	except Exception as e:
+		print(f"\n❌ Error processing {category_name}: {e}")
+		import traceback
+		traceback.print_exc()
+		return 0
+
+
 def main():
 	# Create output directory
 	os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -2849,7 +3094,7 @@ def main():
 		print("  1. Constitutional Acts")
 		print("  2. Consolidated Statutes")
 		print("  3. Annual Statutes")
-		print("  4. Regulations (TODO)")
+		print("  4. Regulations")
 		print("="*80 + "\n")
 		
 		# Category 1: Constitutional Acts
@@ -2871,16 +3116,22 @@ def main():
 		# 	traceback.print_exc()
 		
 		# Category 3: Annual Statutes
+		# try:
+		# 	count = process_annual_statutes(page, chrome_page, tracking_data)
+		# 	total_processed += count
+		# except Exception as e:
+		# 	print(f"\n❌ Failed to process Annual Statutes: {e}")
+		# 	import traceback
+		# 	traceback.print_exc()
+		
+		# Category 4: Regulations
 		try:
-			count = process_annual_statutes(page, chrome_page, tracking_data)
+			count = process_regulations(page, chrome_page, tracking_data)
 			total_processed += count
 		except Exception as e:
-			print(f"\n❌ Failed to process Annual Statutes: {e}")
+			print(f"\n❌ Failed to process Regulations: {e}")
 			import traceback
 			traceback.print_exc()
-		
-		# Category 4: Regulations (TODO - to be implemented)
-		print("\n⏭️  Regulations - NOT YET IMPLEMENTED\n")
 		
 		print("\n" + "="*80)
 		print("SCRAPING COMPLETE")
