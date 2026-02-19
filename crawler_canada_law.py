@@ -14,17 +14,48 @@ from dotenv import load_dotenv
 import platform
 from PIL import Image
 import logging
+import sys
 
 # Load environment variables
 load_dotenv()
 
-# Configure logging
-logging.basicConfig(
-	level=logging.INFO,
-	format='%(asctime)s - %(levelname)s - %(message)s',
-	datefmt='%Y-%m-%d %H:%M:%S'
-)
+# Configure logging with both console and file handlers
+# Create logs directory if it doesn't exist
+os.makedirs('logs', exist_ok=True)
+
+# Create formatters
+log_format = '%(asctime)s - %(levelname)s - %(message)s'
+date_format = '%Y-%m-%d %H:%M:%S'
+formatter = logging.Formatter(log_format, datefmt=date_format)
+
+# Setup logger
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# Console handler with forced flush for real-time output
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(formatter)
+# Force flush after each log message for real-time output
+class FlushStreamHandler(logging.StreamHandler):
+	def emit(self, record):
+		super().emit(record)
+		self.flush()
+console_handler = FlushStreamHandler(sys.stdout)
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+
+# File handler for persistent logs
+log_filename = f"logs/crawler_{time.strftime('%Y%m%d_%H%M%S')}.log"
+file_handler = logging.FileHandler(log_filename, encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+logger.info(f"📋 Logging initialized - Console and file: {log_filename}")
+
+# Prevent duplicate logs from propagating to root logger
+logger.propagate = False
 
 BASE_URL = "https://www.canlii.org"
 START_URL = "https://www.canlii.org/ca"
@@ -250,7 +281,7 @@ def upload_to_s3(local_file_path, s3_key):
 	try:
 		# Check if file already exists in S3
 		if file_exists_in_s3(s3_key):
-			print(f"  ⏭️  Already in S3: s3://{S3_BUCKET_NAME}/{s3_key}")
+			logger.info(f"⏭️  Already in S3: s3://{S3_BUCKET_NAME}/{s3_key}")
 			return True  # Return True so local file gets deleted
 		
 		s3_client = boto3.client(
@@ -262,10 +293,10 @@ def upload_to_s3(local_file_path, s3_key):
 		
 		# Upload the file
 		s3_client.upload_file(local_file_path, S3_BUCKET_NAME, s3_key)
-		print(f"  ✓ Uploaded to S3: s3://{S3_BUCKET_NAME}/{s3_key}")
+		logger.info(f"✓ Uploaded to S3: s3://{S3_BUCKET_NAME}/{s3_key}")
 		return True
 	except Exception as e:
-		print(f"  ✗ S3 upload failed: {e}")
+		logger.error(f"✗ S3 upload failed: {e}")
 		return False
 
 
@@ -274,7 +305,7 @@ def delete_from_s3(s3_key):
 	try:
 		# First check if file exists
 		if not file_exists_in_s3(s3_key):
-			print(f"  ℹ️  Not in S3 (already deleted or never uploaded): {s3_key}")
+			logger.info(f"ℹ️  Not in S3 (already deleted or never uploaded): {s3_key}")
 			return True
 		
 		s3_client = boto3.client(
@@ -286,10 +317,10 @@ def delete_from_s3(s3_key):
 		
 		# Delete the object
 		s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
-		print(f"  🗑️  Deleted from S3: s3://{S3_BUCKET_NAME}/{s3_key}")
+		logger.info(f"🗑️  Deleted from S3: s3://{S3_BUCKET_NAME}/{s3_key}")
 		return True
 	except Exception as e:
-		print(f"  ✗ S3 deletion failed: {e}")
+		logger.error(f"✗ S3 deletion failed: {e}")
 		return False
 
 
@@ -306,7 +337,7 @@ def load_tracking_data():
 					data["processed_documents"] = []
 				return data
 		except Exception as e:
-			print(f"Warning: Could not load tracking file: {e}")
+			logger.warning(f"⚠️  Could not load tracking file: {e}")
 			return {"processed_documents": [], "processed_keys": []}
 	return {"processed_documents": [], "processed_keys": []}
 
@@ -1612,24 +1643,33 @@ def process_legislation_document(page, chrome_page, href, title, citation, prefi
 	# Create document key for tracking
 	doc_key = f"{prefix}_{href}"
 	
-	# Check local tracking
-	if is_already_processed(tracking_data, doc_key):
-		print(f"    ⏭️  Skipping (already processed)")
-		return False
-
 	# Create sanitized filename
 	safe_filename = sanitize_filename(f"{citation}_{title}"[:150]) if citation else sanitize_filename(f"{title}"[:150])
 	s3_key = f"{safe_filename}.pdf"
 	
-
-		
+	# Log document being processed
+	logger.info("=" * 80)
+	logger.info(f"📄 PROCESSING DOCUMENT: {title}")
+	if citation:
+		logger.info(f"   Citation: {citation}")
+	logger.info(f"   Filename: {safe_filename}.pdf")
+	logger.info(f"   URL: {BASE_URL}{href}")
+	logger.info("=" * 80)
+	
+	# Check local tracking
+	if is_already_processed(tracking_data, doc_key):
+		logger.info(f"⏭️  Skipping (already processed) - {title}")
+		return False
+	
 	# Go to document page
 	doc_url = f"{BASE_URL}{href}"
 	try:
+		logger.info(f"🌐 Navigating to document page...")
 		try:
 			page.goto(doc_url, wait_until="load", timeout=30000)
+			logger.info(f"✅ Page loaded successfully")
 		except Exception as e:
-			print(f"    ⚠️  Navigation error: {e}")
+			logger.warning(f"⚠️  Navigation error: {e}")
 			
 		page.wait_for_load_state("domcontentloaded")
 		page.wait_for_timeout(WAIT_MS)
@@ -1639,27 +1679,33 @@ def process_legislation_document(page, chrome_page, href, title, citation, prefi
 		
 		# Check for CAPTCHA interruption
 		if is_captcha_page(page):
-			print("    ⚠️  CAPTCHA detected on document page!")
+			logger.warning(f"⚠️  CAPTCHA detected on document page!")
 			if handle_captcha_interruption(page):
-				print("    🔄 Resuming document processing after recovery...")
+				logger.info(f"🔄 Resuming document processing after recovery...")
 				# Retry navigation
 				page.goto(doc_url, wait_until="load")
 				page.wait_for_load_state("domcontentloaded")
 				force_remove_cookie_modal(page)  # Remove again after recovery
 			else:
-				print("    ❌ Could not recover from CAPTCHA. Skipping this doc.")
+				logger.error(f"❌ Could not recover from CAPTCHA. Skipping this doc.")
 				return False
 
 		# Extract content (checks for in-force status inside)
+		logger.info(f"📝 Extracting document content...")
 		doc_title, content_html = extract_document_content(page, href, title)
 		
 		if doc_title and content_html:
 			pdf_path = os.path.join(OUTPUT_DIR, s3_key)
+			logger.info(f"📄 Content extracted successfully")
 			
 			# Generate PDF using Chrome
+			logger.info(f"🖨️  Generating PDF...")
 			if create_pdf_from_html(chrome_page, doc_title, content_html, pdf_path):
+				logger.info(f"✅ PDF generated: {pdf_path}")
 				# Upload to S3
+				logger.info(f"☁️  Uploading to S3...")
 				if upload_to_s3(pdf_path, s3_key):
+					logger.info(f"✅ Upload successful: s3://{S3_BUCKET_NAME}/{s3_key}")
 					delete_local_file(pdf_path)
 					mark_as_processed(tracking_data, {
 						"key": doc_key,
@@ -1669,10 +1715,20 @@ def process_legislation_document(page, chrome_page, href, title, citation, prefi
 						"url": f"{BASE_URL}{href}",
 						"s3_key": s3_key
 					})
+					logger.info(f"✅ DOCUMENT COMPLETED: {title}")
 					delay_between_downloads()
 					return True
+				else:
+					logger.error(f"❌ S3 upload failed for: {title}")
+			else:
+				logger.error(f"❌ PDF generation failed for: {title}")
+		else:
+			logger.warning(f"⚠️  Could not extract content for: {title}")
+			
 	except Exception as e:
-		print(f"    Error processing document {title}: {e}")
+		logger.error(f"❌ Error processing document {title}: {e}")
+		import traceback
+		logger.error(traceback.format_exc())
 	
 	return False
 
@@ -2943,20 +2999,20 @@ def process_regulations(page, chrome_page, tracking_data):
 					pass
 				continue
 		
-		print(f"\n{'='*80}")
-		print(f"✓ {category_name} COMPLETE")
-		print(f"  Downloaded: {processed_count} regulations")
-		print(f"  Deleted (repealed): {deleted_count} regulations")
-		print(f"  Skipped (repealed, never downloaded): {skipped_repealed - deleted_count}")
-		print(f"  Skipped (already done): {skipped_already_done}")
-		print(f"{'='*80}\n")
+		logger.info(f"\n{'='*80}")
+		logger.info(f"✓ {category_name} COMPLETE")
+		logger.info(f"  Downloaded: {processed_count} regulations")
+		logger.info(f"  Deleted (repealed): {deleted_count} regulations")
+		logger.info(f"  Skipped (repealed, never downloaded): {skipped_repealed - deleted_count}")
+		logger.info(f"  Skipped (already done): {skipped_already_done}")
+		logger.info(f"{'='*80}\n")
 		
 		return processed_count
 		
 	except Exception as e:
-		print(f"\n❌ Error processing {category_name}: {e}")
+		logger.error(f"\n❌ Error processing {category_name}: {e}")
 		import traceback
-		traceback.print_exc()
+		logger.error(traceback.format_exc())
 		return 0
 
 
@@ -2966,7 +3022,7 @@ def main():
 	
 	# Load tracking data for resume functionality
 	tracking_data = load_tracking_data()
-	print(f"Loaded tracking data: {len(tracking_data.get('processed_documents', []))} documents already processed")
+	logger.info(f"📊 Loaded tracking data: {len(tracking_data.get('processed_documents', []))} documents already processed")
 	
 	with sync_playwright() as p:
 		# Determine headless mode:
@@ -3087,59 +3143,59 @@ def main():
 		# Process each legislation category individually with specialized handlers
 		total_processed = 0
 		
-		print("\n" + "="*80)
-		print("LEGISLATION CRAWLER - CATEGORY-BY-CATEGORY PROCESSING")
-		print("="*80)
-		print("\nCategories to process:")
-		print("  1. Constitutional Acts")
-		print("  2. Consolidated Statutes")
-		print("  3. Annual Statutes")
-		print("  4. Regulations")
-		print("="*80 + "\n")
+		logger.info("\n" + "="*80)
+		logger.info("📚 LEGISLATION CRAWLER - CATEGORY-BY-CATEGORY PROCESSING")
+		logger.info("="*80)
+		logger.info("\nCategories to process:")
+		logger.info("  1. Constitutional Acts")
+		logger.info("  2. Consolidated Statutes")
+		logger.info("  3. Annual Statutes")
+		logger.info("  4. Regulations")
+		logger.info("="*80 + "\n")
 		
 		# Category 1: Constitutional Acts
-		# try:
-		# 	count = process_constitutional_acts(page, chrome_page, tracking_data)
-		# 	total_processed += count
-		# except Exception as e:
-		# 	print(f"\n❌ Failed to process Constitutional Acts: {e}")
-		# 	import traceback
-		# 	traceback.print_exc()
+		try:
+			count = process_constitutional_acts(page, chrome_page, tracking_data)
+			total_processed += count
+		except Exception as e:
+			print(f"\n❌ Failed to process Constitutional Acts: {e}")
+			import traceback
+			traceback.print_exc()
 		
-		# # Category 2: Consolidated Statutes
-		# try:
-		# 	count = process_consolidated_statutes(page, chrome_page, tracking_data)
-		# 	total_processed += count
-		# except Exception as e:
-		# 	print(f"\n❌ Failed to process Consolidated Statutes: {e}")
-		# 	import traceback
-		# 	traceback.print_exc()
+		# Category 2: Consolidated Statutes
+		try:
+			count = process_consolidated_statutes(page, chrome_page, tracking_data)
+			total_processed += count
+		except Exception as e:
+			print(f"\n❌ Failed to process Consolidated Statutes: {e}")
+			import traceback
+			traceback.print_exc()
 		
 		# Category 3: Annual Statutes
-		# try:
-		# 	count = process_annual_statutes(page, chrome_page, tracking_data)
-		# 	total_processed += count
-		# except Exception as e:
-		# 	print(f"\n❌ Failed to process Annual Statutes: {e}")
-		# 	import traceback
-		# 	traceback.print_exc()
+		try:
+			count = process_annual_statutes(page, chrome_page, tracking_data)
+			total_processed += count
+		except Exception as e:
+			print(f"\n❌ Failed to process Annual Statutes: {e}")
+			import traceback
+			traceback.print_exc()
 		
 		# Category 4: Regulations
 		try:
 			count = process_regulations(page, chrome_page, tracking_data)
 			total_processed += count
 		except Exception as e:
-			print(f"\n❌ Failed to process Regulations: {e}")
+			logger.error(f"\n❌ Failed to process Regulations: {e}")
 			import traceback
-			traceback.print_exc()
+			logger.error(traceback.format_exc())
 		
-		print("\n" + "="*80)
-		print("SCRAPING COMPLETE")
-		print("="*80)
-		print(f"Total documents downloaded: {total_processed}")
-		print(f"PDFs saved in S3: s3://{S3_BUCKET_NAME}/")
-		print(f"Tracking file: {TRACKING_FILE}")
-		print("="*80 + "\n")
+		logger.info("\n" + "="*80)
+		logger.info("✅ SCRAPING COMPLETE")
+		logger.info("="*80)
+		logger.info(f"📊 Total documents downloaded: {total_processed}")
+		logger.info(f"☁️  PDFs saved in S3: s3://{S3_BUCKET_NAME}/")
+		logger.info(f"📝 Tracking file: {TRACKING_FILE}")
+		logger.info("="*80 + "\n")
 		
 		chrome_browser.close()
 		browser.close()
