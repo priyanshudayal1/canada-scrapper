@@ -15,6 +15,8 @@ import platform
 from PIL import Image
 import logging
 import sys
+from datetime import datetime
+from email_notifier import send_judgment_notifications
 
 # Load environment variables
 load_dotenv()
@@ -1638,8 +1640,13 @@ def handle_cookie_consent(page):
 		pass
 
 
+# Global list to track newly downloaded documents for email notification
+newly_downloaded_documents = []
+
+
 def process_legislation_document(page, chrome_page, href, title, citation, prefix, tracking_data):
 	"""Process a single legislation document (download, PDF, S3, track)"""
+	global newly_downloaded_documents
 	# Create document key for tracking
 	doc_key = f"{prefix}_{href}"
 	
@@ -1714,6 +1721,17 @@ def process_legislation_document(page, chrome_page, href, title, citation, prefi
 						"href": href,
 						"url": f"{BASE_URL}{href}",
 						"s3_key": s3_key
+					})
+					# Track for email notification
+					newly_downloaded_documents.append({
+						"case_title": title,
+						"cnr": citation or "N/A",
+						"court": "Federal Legislation",
+						"state": "Canada",
+						"download_status": "success",
+						"modal_pdf_url": f"{BASE_URL}{href}",
+						"s3_key": s3_key,
+						"error": ""
 					})
 					logger.info(f"✅ DOCUMENT COMPLETED: {title}")
 					delay_between_downloads()
@@ -3199,6 +3217,24 @@ def main():
 		
 		chrome_browser.close()
 		browser.close()
+		
+		# Send email notifications for newly downloaded documents
+		if newly_downloaded_documents:
+			logger.info("\n" + "="*80)
+			logger.info("📧 SENDING EMAIL NOTIFICATIONS")
+			logger.info("="*80)
+			logger.info(f"📄 {len(newly_downloaded_documents)} new documents to notify about")
+			
+			target_date = datetime.now().strftime("%Y-%m-%d")
+			try:
+				email_result = send_judgment_notifications(newly_downloaded_documents, target_date)
+				logger.info(f"✅ Email notifications sent: {email_result.get('emails_sent', 0)} successful, {email_result.get('emails_failed', 0)} failed")
+			except Exception as e:
+				logger.error(f"❌ Error sending email notifications: {e}")
+				import traceback
+				logger.error(traceback.format_exc())
+		else:
+			logger.info("\n📧 No new documents downloaded, skipping email notifications.")
 
 
 if __name__ == "__main__":
